@@ -92,3 +92,49 @@ tokenizer/
 data/
 voice_samples/
 needle-ui.*
+
+# .NET / Visual Studio
+## Build outputs
+[Oo]bj/
+[Bb]in/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+*.pfx
+*.publishsettings
+[Ww]indow[Ss]ervice.log
+## .NET core
+*.userprefs
+.vs/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+## NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/
+!**/[Pp]ackages/build/
+*.nuget.props
+*.nuget.targets
+## Rider
+.idea/
+## VS Code
+.vscode/
+*.code-workspace
+## MSBuild
+*.binlog
+## Test results
+TestResults/
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+## Publish output
+[Pp]ublish/
+## Logs
+*.log
+*.tmp
