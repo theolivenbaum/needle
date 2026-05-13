@@ -445,7 +445,8 @@ public static class WeightLoader
                 var data = new short[raw.Length / 2];
                 Buffer.BlockCopy(raw, 0, data, 0, raw.Length);
                 using var t16 = torch.tensor(data, dimensions: shape, dtype: ScalarType.Int16);
-                return t16.view(dtype).to(device);
+                // Reinterpret the raw bytes as the target half type via to().
+                return t16.to(dtype).to(device);
             }
             case ScalarType.Int32:
             {

@@ -3,6 +3,7 @@ using TorchSharp;
 using TorchSharp.Modules;
 using static TorchSharp.torch;
 using static TorchSharp.torch.nn;
+using F = TorchSharp.torch.nn.functional;
 
 namespace Needle.Model;
 
@@ -18,10 +19,10 @@ internal static class Init
 
     /// <summary>
     /// Residual weight initialisation: N(0, 0.02 / sqrt(2 * numLayers)).
-    /// Scales down residual branch weights to keep activations stable at init.
+    /// Scales residual branch weights down to keep activations stable at initialisation.
     /// </summary>
     public static void Residual(Tensor t, int numLayers) =>
-        nn.init.normal_(t, mean: 0.0, std: 0.02 / Math.Sqrt(2.0 * numLayers));
+        nn.init.normal_(t, mean: 0.0, std: 0.02 / System.Math.Sqrt(2.0 * numLayers));
 }
 
 // ---------------------------------------------------------------------------
@@ -49,15 +50,15 @@ public sealed class ZCRMSNorm : Module<Tensor, Tensor>
 
     public override Tensor forward(Tensor x)
     {
-        // Cast to float32 for the RMS computation regardless of input dtype.
+        // Cast to float32 for the RMS computation for numerical stability.
         using var xf = x.to(ScalarType.Float32);
 
-        // rms = sqrt(mean(x^2) + eps) over last dimension, keep dims
-        using var sq  = xf.pow(2);
-        using var msq = sq.mean(dim: [-1], keepdim: true);
+        // rms = sqrt(mean(x^2) + eps), keepdim over the last axis.
+        using var sq  = xf.pow(2f);
+        using var msq = sq.mean(new long[] { -1L }, keepdim: true);
         using var rms = (msq + _epsilon).sqrt();
 
-        // (1 + scale) * x / rms — scale is broadcast over all leading dims
+        // (1 + scale) * x / rms  — scale broadcasts over all leading dimensions.
         using var scaleBcast = (1f + scale).to(x.dtype);
         using var norm       = xf / rms;
         return (scaleBcast * norm).to(x.dtype);
@@ -72,7 +73,7 @@ public sealed class ZCRMSNorm : Module<Tensor, Tensor>
 /// Multi-head attention with grouped query attention (GQA) and optional RoPE.
 /// Includes per-head ZCRMSNorm on queries and keys (QK-norm).
 /// </summary>
-public sealed class MultiHeadAttention : Module<Tensor, Tensor, Tensor?, (Tensor cos, Tensor sin)?, bool, Tensor>
+public sealed class MultiHeadAttention : Module<Tensor, Tensor>
 {
     private readonly int _numHeads;
     private readonly int _numKvHeads;
@@ -80,20 +81,20 @@ public sealed class MultiHeadAttention : Module<Tensor, Tensor, Tensor?, (Tensor
     private readonly int _repeats;
     private readonly bool _ropeKeysOnly;
 
-    public readonly Linear q_proj;
-    public readonly Linear k_proj;
-    public readonly Linear v_proj;
-    public readonly Linear out_proj;
+    public readonly Linear    q_proj;
+    public readonly Linear    k_proj;
+    public readonly Linear    v_proj;
+    public readonly Linear    out_proj;
     public readonly ZCRMSNorm q_norm;
     public readonly ZCRMSNorm k_norm;
 
     public MultiHeadAttention(
-        int numHeads,
-        int numKvHeads,
-        int dModel,
-        int numLayers,
+        int  numHeads,
+        int  numKvHeads,
+        int  dModel,
+        int  numLayers,
         bool ropeKeysOnly = false,
-        string name = "MultiHeadAttention")
+        string name       = "MultiHeadAttention")
         : base(name)
     {
         _numHeads    = numHeads;
@@ -112,7 +113,6 @@ public sealed class MultiHeadAttention : Module<Tensor, Tensor, Tensor?, (Tensor
         q_norm = new ZCRMSNorm(_headDim, name: "q_norm");
         k_norm = new ZCRMSNorm(_headDim, name: "k_norm");
 
-        // Weight initialisation
         Init.Default(q_proj.weight!);
         Init.Default(k_proj.weight!);
         Init.Default(v_proj.weight!);
@@ -121,29 +121,31 @@ public sealed class MultiHeadAttention : Module<Tensor, Tensor, Tensor?, (Tensor
         RegisterComponents();
     }
 
+    // The typed Module base only supports a single Tensor input/output; we
+    // expose the real entry-point as a plain method and forward the stub.
+    public override Tensor forward(Tensor input) =>
+        throw new InvalidOperationException("Use the explicit Call() overload.");
+
     /// <summary>
-    /// Forward pass.
+    /// Attention forward.
     /// </summary>
     /// <param name="qInput">Query input [B, T_q, D].</param>
     /// <param name="kvInput">Key/value input [B, T_kv, D].</param>
-    /// <param name="mask">Optional attention mask [B, 1, T_q, T_kv], true = attend.</param>
+    /// <param name="mask">Optional bool mask [B, 1, T_q, T_kv]; true = attend.</param>
     /// <param name="rope">Optional (cos, sin) RoPE tables.</param>
-    /// <param name="training">Whether in training mode (unused here — kept for API symmetry).</param>
-    public override Tensor forward(
-        Tensor qInput,
-        Tensor kvInput,
+    public Tensor Call(
+        Tensor  qInput,
+        Tensor  kvInput,
         Tensor? mask,
-        (Tensor cos, Tensor sin)? rope,
-        bool training)
+        (Tensor cos, Tensor sin)? rope)
     {
         long B = qInput.shape[0];
 
-        // Linear projections
-        using var q = q_proj.forward(qInput);   // [B, T_q, D]
-        using var k = k_proj.forward(kvInput);  // [B, T_kv, kvDim]
-        using var v = v_proj.forward(kvInput);  // [B, T_kv, kvDim]
+        using var q = q_proj.forward(qInput);
+        using var k = k_proj.forward(kvInput);
+        using var v = v_proj.forward(kvInput);
 
-        // Reshape to [B, heads, T, headDim]
+        // Reshape → [B, heads, T, headDim]
         using var qr = q.reshape(B, -1, _numHeads,   _headDim).transpose(1, 2);
         using var kr = k.reshape(B, -1, _numKvHeads, _headDim).transpose(1, 2);
         using var vr = v.reshape(B, -1, _numKvHeads, _headDim).transpose(1, 2);
@@ -152,45 +154,44 @@ public sealed class MultiHeadAttention : Module<Tensor, Tensor, Tensor?, (Tensor
         using var qn = q_norm.forward(qr);
         using var kn = k_norm.forward(kr);
 
-        // GQA: expand KV heads to match Q heads
-        Tensor kExpanded, vExpanded;
+        // GQA: repeat KV heads to match Q heads
+        Tensor kExp, vExp;
         if (_repeats > 1)
         {
-            kExpanded = kn.repeat_interleave(_repeats, dim: 1);
-            vExpanded = vr.repeat_interleave(_repeats, dim: 1);
+            kExp = kn.repeat_interleave(_repeats, dim: 1);
+            vExp = vr.repeat_interleave(_repeats, dim: 1);
         }
         else
         {
-            kExpanded = kn.alias();
-            vExpanded = vr.alias();
+            kExp = kn.alias();
+            vExp = vr.alias();
         }
 
-        // RoPE
+        // RoPE application
         Tensor qFinal, kFinal;
         if (rope.HasValue)
         {
             var (cos, sin) = rope.Value;
-            kFinal = RoPE.ApplyRope(kExpanded, cos, sin);
+            kFinal = RoPE.ApplyRope(kExp, cos, sin);
             qFinal = _ropeKeysOnly ? qn.alias() : RoPE.ApplyRope(qn, cos, sin);
         }
         else
         {
             qFinal = qn.alias();
-            kFinal = kExpanded.alias();
+            kFinal = kExp.alias();
         }
 
-        // Scaled dot-product attention
+        // Scaled dot-product: [B, H, T_q, T_kv]
         float scale = MathF.Sqrt(_headDim);
-        using var kt = kFinal.transpose(2, 3);  // [B, H, headDim, T_kv]
-        using var scores = torch.matmul(qFinal, kt) / scale; // [B, H, T_q, T_kv]
+        using var kt     = kFinal.transpose(2, 3);
+        using var scores = torch.matmul(qFinal, kt) / scale;
 
         Tensor attnWeights;
         if (mask is not null)
         {
-            // Where mask is false, fill with -inf so softmax zeroes those positions.
-            using var maskFloat = mask.to(scores.dtype);
-            using var negInf    = torch.full(scores.shape, float.NegativeInfinity, dtype: scores.dtype, device: scores.device);
-            using var masked    = torch.where(mask, scores, negInf);
+            using var negInf = torch.full(scores.shape, float.NegativeInfinity,
+                                          dtype: scores.dtype, device: scores.device);
+            using var masked = torch.where(mask, scores, negInf);
             attnWeights = torch.softmax(masked, dim: -1);
         }
         else
@@ -198,19 +199,15 @@ public sealed class MultiHeadAttention : Module<Tensor, Tensor, Tensor?, (Tensor
             attnWeights = torch.softmax(scores, dim: -1);
         }
 
-        // Weighted sum over values
-        using var attnOut = torch.matmul(attnWeights, vExpanded); // [B, H, T_q, headDim]
+        using var attnOut = torch.matmul(attnWeights, vExp);
         attnWeights.Dispose();
-
-        // Merge heads: [B, T_q, D]
-        using var merged = attnOut.transpose(1, 2).reshape(B, -1, _numHeads * _headDim);
-
-        // Cleanup GQA temporaries
-        if (_repeats > 1) { kExpanded.Dispose(); vExpanded.Dispose(); }
-        else              { kExpanded.Dispose(); vExpanded.Dispose(); }
+        kExp.Dispose();
+        vExp.Dispose();
         qFinal.Dispose();
         kFinal.Dispose();
 
+        // Merge heads → [B, T_q, D]
+        using var merged = attnOut.transpose(1, 2).reshape(B, -1, _numHeads * _headDim);
         return out_proj.forward(merged);
     }
 }
@@ -230,14 +227,19 @@ public sealed class FeedForward : Module<Tensor, Tensor>
     public readonly Linear up_proj;
     public readonly Linear down_proj;
 
-    public FeedForward(int dModel, int dFf, int numLayers, string activation = "drelu", string name = "FeedForward")
+    public FeedForward(
+        int    dModel,
+        int    dFf,
+        int    numLayers,
+        string activation = "drelu",
+        string name       = "FeedForward")
         : base(name)
     {
         _activation = activation;
 
-        gate_proj = Linear(dModel, dFf, hasBias: false);
-        up_proj   = Linear(dModel, dFf, hasBias: false);
-        down_proj = Linear(dFf, dModel, hasBias: false);
+        gate_proj = Linear(dModel, dFf,   hasBias: false);
+        up_proj   = Linear(dModel, dFf,   hasBias: false);
+        down_proj = Linear(dFf,   dModel, hasBias: false);
 
         Init.Default(gate_proj.weight!);
         Init.Default(up_proj.weight!);
@@ -255,21 +257,27 @@ public sealed class FeedForward : Module<Tensor, Tensor>
         switch (_activation)
         {
             case "swiglu":
-                using var silu = torch.nn.functional.silu(gate);
+            {
+                using var silu = F.silu(gate);
                 h = silu * up;
                 break;
+            }
             case "geglu":
-                using var gelu = torch.nn.functional.gelu(gate);
+            {
+                using var gelu = F.gelu(gate);
                 h = gelu * up;
                 break;
-            default: // "drelu"
-                using var rg = torch.relu(gate);
-                using var ru = torch.relu(up);
+            }
+            default: // "drelu" — double ReLU gate
+            {
+                using var rg = F.relu(gate);
+                using var ru = F.relu(up);
                 h = rg * ru;
                 break;
+            }
         }
 
-        using var hDispose = h;
+        using var hD = h;
         return down_proj.forward(h);
     }
 }
@@ -282,27 +290,27 @@ public sealed class FeedForward : Module<Tensor, Tensor>
 /// A single encoder block: pre-norm self-attention with a gated residual,
 /// optionally followed by a pre-norm feed-forward with a gated residual.
 /// </summary>
-public sealed class EncoderBlock : Module<Tensor, Tensor?, (Tensor cos, Tensor sin)?, bool, Tensor>
+public sealed class EncoderBlock : Module<Tensor, Tensor>
 {
     private readonly bool _noFeedforward;
 
-    public readonly ZCRMSNorm        attn_norm;
+    public readonly ZCRMSNorm          attn_norm;
     public readonly MultiHeadAttention self_attn;
-    public readonly Parameter        attn_gate;
+    public readonly Parameter          attn_gate;
 
-    // Optional FFN sublayer
-    public readonly ZCRMSNorm?  ffn_norm;
+    // Optional FFN sublayer fields
+    public readonly ZCRMSNorm?   ffn_norm;
     public readonly FeedForward? ffn;
     public readonly Parameter?   ffn_gate;
 
     public EncoderBlock(
-        int numHeads,
-        int numKvHeads,
-        int dModel,
-        int dFf,
-        int numLayers,
+        int    numHeads,
+        int    numKvHeads,
+        int    dModel,
+        int    dFf,
+        int    numLayers,
         string activation  = "drelu",
-        bool noFeedforward = true,
+        bool   noFeedforward = true,
         string name        = "EncoderBlock")
         : base(name)
     {
@@ -310,7 +318,7 @@ public sealed class EncoderBlock : Module<Tensor, Tensor?, (Tensor cos, Tensor s
 
         attn_norm = new ZCRMSNorm(dModel, name: "attn_norm");
         self_attn = new MultiHeadAttention(numHeads, numKvHeads, dModel, numLayers, name: "self_attn");
-        attn_gate = Parameter(zeros(1));  // scalar gate, sigmoid-activated
+        attn_gate = Parameter(zeros(1));
 
         if (!noFeedforward)
         {
@@ -322,27 +330,26 @@ public sealed class EncoderBlock : Module<Tensor, Tensor?, (Tensor cos, Tensor s
         RegisterComponents();
     }
 
-    public override Tensor forward(
-        Tensor x,
-        Tensor? mask,
-        (Tensor cos, Tensor sin)? rope,
-        bool training)
+    // Stub — real logic in Call()
+    public override Tensor forward(Tensor input) =>
+        throw new InvalidOperationException("Use the explicit Call() overload.");
+
+    public Tensor Call(Tensor x, Tensor? mask, (Tensor cos, Tensor sin)? rope)
     {
-        // Self-attention sublayer with gated residual
-        var gate = torch.sigmoid(attn_gate).squeeze();
-        using var normed   = attn_norm.forward(x);
-        using var attnOut  = self_attn.forward(normed, normed, mask, rope, training);
-        var residual = x + gate * attnOut;
+        // Self-attention sublayer with scalar gated residual
+        using var g1      = torch.sigmoid(attn_gate).squeeze();
+        using var normed1 = attn_norm.forward(x);
+        using var attnOut = self_attn.Call(normed1, normed1, mask, rope);
+        var h = x + g1 * attnOut;
 
         if (_noFeedforward || ffn is null)
-            return residual;
+            return h;
 
-        // FFN sublayer with gated residual
-        var ffnG = torch.sigmoid(ffn_gate!).squeeze();
-        using var normed2  = ffn_norm!.forward(residual);
-        using var ffnOut   = ffn.forward(normed2);
-        using var rDispose = residual;
-        return rDispose + ffnG * ffnOut;
+        using var g2      = torch.sigmoid(ffn_gate!).squeeze();
+        using var normed2 = ffn_norm!.forward(h);
+        using var ffnOut  = ffn.forward(normed2);
+        using var hD      = h;
+        return hD + g2 * ffnOut;
     }
 }
 
@@ -352,9 +359,8 @@ public sealed class EncoderBlock : Module<Tensor, Tensor?, (Tensor cos, Tensor s
 
 /// <summary>
 /// Stack of <see cref="EncoderBlock"/>s followed by a final ZCRMSNorm.
-/// Returns (output [B, T, D], mask).
 /// </summary>
-public sealed class Encoder : Module<Tensor, Tensor?, (Tensor cos, Tensor sin)?, bool, (Tensor output, Tensor? mask)>
+public sealed class Encoder : Module<Tensor, Tensor>
 {
     private readonly ModuleList<EncoderBlock> _layers;
     public readonly ZCRMSNorm final_norm;
@@ -373,15 +379,20 @@ public sealed class Encoder : Module<Tensor, Tensor?, (Tensor cos, Tensor sin)?,
         RegisterComponents();
     }
 
-    public override (Tensor output, Tensor? mask) forward(
+    public override Tensor forward(Tensor input) =>
+        throw new InvalidOperationException("Use the explicit Call() overload.");
+
+    public (Tensor output, Tensor? mask) Call(
         Tensor x,
         Tensor? mask,
-        (Tensor cos, Tensor sin)? rope,
-        bool training)
+        (Tensor cos, Tensor sin)? rope)
     {
         foreach (var layer in _layers)
-            x = layer.forward(x, mask, rope, training);
-
+        {
+            var next = layer.Call(x, mask, rope);
+            x.Dispose();
+            x = next;
+        }
         return (final_norm.forward(x), mask);
     }
 }
@@ -394,7 +405,7 @@ public sealed class Encoder : Module<Tensor, Tensor?, (Tensor cos, Tensor sin)?,
 /// A single decoder block: gated self-attention + gated cross-attention,
 /// optionally followed by a gated feed-forward sublayer.
 /// </summary>
-public sealed class DecoderBlock : Module<Tensor, Tensor, Tensor?, Tensor?, (Tensor cos, Tensor sin)?, bool, Tensor>
+public sealed class DecoderBlock : Module<Tensor, Tensor>
 {
     private readonly bool _noFeedforward;
 
@@ -406,18 +417,18 @@ public sealed class DecoderBlock : Module<Tensor, Tensor, Tensor?, Tensor?, (Ten
     public readonly MultiHeadAttention cross_attn;
     public readonly Parameter          cross_attn_gate;
 
-    public readonly ZCRMSNorm?  ffn_norm;
+    public readonly ZCRMSNorm?   ffn_norm;
     public readonly FeedForward? ffn;
     public readonly Parameter?   ffn_gate;
 
     public DecoderBlock(
-        int numHeads,
-        int numKvHeads,
-        int dModel,
-        int dFf,
-        int numLayers,
+        int    numHeads,
+        int    numKvHeads,
+        int    dModel,
+        int    dFf,
+        int    numLayers,
         string activation  = "drelu",
-        bool noFeedforward = true,
+        bool   noFeedforward = true,
         string name        = "DecoderBlock")
         : base(name)
     {
@@ -427,8 +438,10 @@ public sealed class DecoderBlock : Module<Tensor, Tensor, Tensor?, Tensor?, (Ten
         self_attn       = new MultiHeadAttention(numHeads, numKvHeads, dModel, numLayers, name: "self_attn");
         self_attn_gate  = Parameter(zeros(1));
 
+        // Cross-attention uses rope only on keys, not queries (rope_keys_only=true)
         cross_attn_norm = new ZCRMSNorm(dModel, name: "cross_attn_norm");
-        cross_attn      = new MultiHeadAttention(numHeads, numKvHeads, dModel, numLayers, ropeKeysOnly: true, name: "cross_attn");
+        cross_attn      = new MultiHeadAttention(numHeads, numKvHeads, dModel, numLayers,
+                                                  ropeKeysOnly: true, name: "cross_attn");
         cross_attn_gate = Parameter(zeros(1));
 
         if (!noFeedforward)
@@ -441,45 +454,42 @@ public sealed class DecoderBlock : Module<Tensor, Tensor, Tensor?, Tensor?, (Ten
         RegisterComponents();
     }
 
-    /// <summary>
-    /// Decoder block forward.
-    /// </summary>
+    public override Tensor forward(Tensor input) =>
+        throw new InvalidOperationException("Use the explicit Call() overload.");
+
     /// <param name="x">Decoder hidden states [B, T_dec, D].</param>
     /// <param name="encoderOut">Encoder output [B, T_enc, D].</param>
     /// <param name="selfMask">Causal/padding mask [B, 1, T_dec, T_dec].</param>
     /// <param name="crossMask">Cross-attention mask [B, 1, T_dec, T_enc].</param>
-    /// <param name="rope">RoPE tables for self-attention (not used in cross-attention).</param>
-    /// <param name="training">Training mode flag.</param>
-    public override Tensor forward(
-        Tensor x,
-        Tensor encoderOut,
+    /// <param name="rope">RoPE tables for the self-attention sublayer.</param>
+    public Tensor Call(
+        Tensor  x,
+        Tensor  encoderOut,
         Tensor? selfMask,
         Tensor? crossMask,
-        (Tensor cos, Tensor sin)? rope,
-        bool training)
+        (Tensor cos, Tensor sin)? rope)
     {
         // Self-attention
-        var selfG = torch.sigmoid(self_attn_gate).squeeze();
-        using var sn = self_attn_norm.forward(x);
-        using var sa = self_attn.forward(sn, sn, selfMask, rope, training);
-        var h = x + selfG * sa;
+        using var sg  = torch.sigmoid(self_attn_gate).squeeze();
+        using var sn  = self_attn_norm.forward(x);
+        using var sa  = self_attn.Call(sn, sn, selfMask, rope);
+        var h = x + sg * sa;
 
-        // Cross-attention (no RoPE on queries for cross-attn)
-        var crossG = torch.sigmoid(cross_attn_gate).squeeze();
-        using var cn = cross_attn_norm.forward(h);
-        using var ca = cross_attn.forward(cn, encoderOut, crossMask, null, training);
-        using var hDispose = h;
-        h = hDispose + crossG * ca;
+        // Cross-attention (no RoPE on queries)
+        using var cg  = torch.sigmoid(cross_attn_gate).squeeze();
+        using var cn  = cross_attn_norm.forward(h);
+        using var ca  = cross_attn.Call(cn, encoderOut, crossMask, null);
+        using var hD1 = h;
+        h = hD1 + cg * ca;
 
         if (_noFeedforward || ffn is null)
             return h;
 
-        // FFN
-        var ffnG = torch.sigmoid(ffn_gate!).squeeze();
+        using var fg  = torch.sigmoid(ffn_gate!).squeeze();
         using var fn2 = ffn_norm!.forward(h);
         using var fo  = ffn.forward(fn2);
-        using var hd2 = h;
-        return hd2 + ffnG * fo;
+        using var hD2 = h;
+        return hD2 + fg * fo;
     }
 }
 
@@ -490,7 +500,7 @@ public sealed class DecoderBlock : Module<Tensor, Tensor, Tensor?, Tensor?, (Ten
 /// <summary>
 /// Stack of <see cref="DecoderBlock"/>s followed by a final ZCRMSNorm.
 /// </summary>
-public sealed class Decoder : Module<Tensor, Tensor, Tensor?, Tensor?, (Tensor cos, Tensor sin)?, bool, Tensor>
+public sealed class Decoder : Module<Tensor, Tensor>
 {
     private readonly ModuleList<DecoderBlock> _layers;
     public readonly ZCRMSNorm final_norm;
@@ -509,17 +519,22 @@ public sealed class Decoder : Module<Tensor, Tensor, Tensor?, Tensor?, (Tensor c
         RegisterComponents();
     }
 
-    public override Tensor forward(
-        Tensor x,
-        Tensor encoderOut,
+    public override Tensor forward(Tensor input) =>
+        throw new InvalidOperationException("Use the explicit Call() overload.");
+
+    public Tensor Call(
+        Tensor  x,
+        Tensor  encoderOut,
         Tensor? selfMask,
         Tensor? crossMask,
-        (Tensor cos, Tensor sin)? rope,
-        bool training)
+        (Tensor cos, Tensor sin)? rope)
     {
         foreach (var layer in _layers)
-            x = layer.forward(x, encoderOut, selfMask, crossMask, rope, training);
-
+        {
+            var next = layer.Call(x, encoderOut, selfMask, crossMask, rope);
+            x.Dispose();
+            x = next;
+        }
         return final_norm.forward(x);
     }
 }
@@ -537,14 +552,13 @@ public sealed class Decoder : Module<Tensor, Tensor, Tensor?, Tensor?, (Tensor c
 ///   <item>Zero-centred RMSNorm throughout</item>
 ///   <item>Contrastive encoding head</item>
 /// </list>
-/// Port of the Python <c>SimpleAttentionNetwork</c> in architecture.py.
+/// Port of <c>SimpleAttentionNetwork</c> from architecture.py.
 /// </summary>
-public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor, Tensor?, Tensor?, Tensor?, Tensor>
+public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
 {
     private readonly TransformerConfig _cfg;
-    private readonly float _embedScale;
+    private readonly float             _embedScale;
 
-    // Sub-modules
     public readonly Embedding embedding;
     public readonly Encoder   encoder;
     public readonly Decoder   decoder;
@@ -560,7 +574,7 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor, Tensor?, Ten
         _cfg        = cfg;
         _embedScale = MathF.Sqrt(cfg.DModel);
 
-        embedding = Embedding(cfg.VocabSize, cfg.DModel);
+        embedding = nn.Embedding(cfg.VocabSize, cfg.DModel);
         nn.init.normal_(embedding.weight!, std: 0.02);
 
         encoder = new Encoder(cfg, name: "encoder");
@@ -577,15 +591,19 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor, Tensor?, Ten
         RegisterComponents();
     }
 
-    // ── RoPE helpers ─────────────────────────────────────────────────────────
+    // Stub — use the typed API methods below.
+    public override Tensor forward(Tensor input) =>
+        throw new InvalidOperationException("Use Forward(), EncodeText(), or Decode() instead.");
+
+    // ── RoPE helper ───────────────────────────────────────────────────────────
 
     private (Tensor cos, Tensor sin) GetRope(long seqLen, Device? device = null)
     {
         var (cos, sin) = RoPE.PrecomputeFreqs(_cfg.HeadDim, (int)seqLen, _cfg.RopeTheta);
         if (device is not null)
         {
-            cos = cos.to(device);
-            sin = sin.to(device);
+            var cos2 = cos.to(device); cos.Dispose(); cos = cos2;
+            var sin2 = sin.to(device); sin.Dispose(); sin = sin2;
         }
         return (cos, sin);
     }
@@ -593,17 +611,17 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor, Tensor?, Ten
     // ── Public API ────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Encode a source token sequence.
+    /// Encode a source token sequence through the encoder stack.
     /// </summary>
-    /// <param name="src">Token IDs [B, T_enc].</param>
-    /// <param name="srcMask">Optional padding/packing mask [B, 1, 1, T_enc].</param>
+    /// <param name="src">Token IDs [B, T_enc] (int64).</param>
+    /// <param name="srcMask">Optional attention mask [B, 1, 1, T_enc] (bool).</param>
     /// <returns>(encoderOutput [B, T_enc, D], mask)</returns>
     public (Tensor encoderOut, Tensor? encMask) EncodeText(Tensor src, Tensor? srcMask = null)
     {
         using var emb  = embedding.forward(src);
         using var embS = emb * _embedScale;
-        var rope = GetRope(src.shape[1], src.device);
-        var result = encoder.forward(embS, srcMask, rope, training: false);
+        var rope   = GetRope(src.shape[1], src.device);
+        var result = encoder.Call(embS, srcMask, rope);
         rope.cos.Dispose();
         rope.sin.Dispose();
         return result;
@@ -612,21 +630,21 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor, Tensor?, Ten
     /// <summary>
     /// Run the decoder and return logits over the vocabulary.
     /// </summary>
-    /// <param name="tgt">Target token IDs [B, T_dec].</param>
+    /// <param name="tgt">Target token IDs [B, T_dec] (int64).</param>
     /// <param name="encoderOut">Encoder hidden states [B, T_enc, D].</param>
-    /// <param name="selfMask">Optional causal mask [B, 1, T_dec, T_dec].</param>
-    /// <param name="crossMask">Optional cross-attention mask [B, 1, T_dec, T_enc].</param>
-    /// <returns>Logits [B, T_dec, VocabSize].</returns>
+    /// <param name="selfMask">Optional causal mask [B, 1, T_dec, T_dec] (bool).</param>
+    /// <param name="crossMask">Optional cross-attention mask [B, 1, T_dec, T_enc] (bool).</param>
+    /// <returns>Logits [B, T_dec, VocabSize] (float32).</returns>
     public Tensor Decode(
-        Tensor tgt,
-        Tensor encoderOut,
+        Tensor  tgt,
+        Tensor  encoderOut,
         Tensor? selfMask  = null,
         Tensor? crossMask = null)
     {
-        using var emb  = embedding.forward(tgt);
-        using var embS = emb * _embedScale;
-        var rope = GetRope(tgt.shape[1], tgt.device);
-        using var hidden = decoder.forward(embS, encoderOut, selfMask, crossMask, rope, training: false);
+        using var emb    = embedding.forward(tgt);
+        using var embS   = emb * _embedScale;
+        var rope         = GetRope(tgt.shape[1], tgt.device);
+        using var hidden = decoder.Call(embS, encoderOut, selfMask, crossMask, rope);
         rope.cos.Dispose();
         rope.sin.Dispose();
 
@@ -638,36 +656,38 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor, Tensor?, Ten
 
     /// <summary>
     /// Encode tokens to a normalised contrastive embedding.
-    /// Pipeline: mean-pool encoder output → ReLU hidden → linear proj → L2-norm.
+    /// Pipeline: encode → mean-pool → ReLU hidden → proj → L2-norm.
     /// </summary>
-    /// <param name="tokens">Token IDs [B, T].</param>
-    /// <returns>L2-normalised embeddings [B, ContrastiveDim].</returns>
+    /// <param name="tokens">Token IDs [B, T] (int64).</param>
+    /// <returns>L2-normalised embeddings [B, ContrastiveDim] (float32).</returns>
     public Tensor EncodeContrastive(Tensor tokens)
     {
-        var srcMask = MaskUtils.MakePaddingMask(tokens, _cfg.PadTokenId);
-        var (encOut, encMask) = EncodeText(tokens, srcMask);
+        using var srcMask        = MaskUtils.MakePaddingMask(tokens, _cfg.PadTokenId);
+        var (encOut, encMask)    = EncodeText(tokens, srcMask);
+        using var encOutD        = encOut;
 
         using var pooled   = MeanPool(encOut, encMask);
-        using var h        = torch.relu(contrastive_hidden.forward(pooled));
-        using var proj     = contrastive_proj.forward(h);
+        using var hRelu    = F.relu(contrastive_hidden.forward(pooled));
+        using var proj     = contrastive_proj.forward(hRelu);
         using var projF    = proj.to(ScalarType.Float32);
-        using var sq       = projF.pow(2);
-        using var sumsq    = sq.sum(dim: [-1], keepdim: true);
-        using var denom    = (sumsq + 1e-12f).sqrt();
+        using var sq       = projF.pow(2f);
+        using var sumSq    = sq.sum(new long[] { -1L }, keepdim: true);
+        using var denom    = (sumSq + 1e-12f).sqrt();
         return (projF / denom).to(proj.dtype);
     }
 
     /// <summary>
-    /// Full encoder-decoder forward pass; returns logits [B, T_dec, VocabSize].
+    /// Full encoder-decoder forward pass returning logits [B, T_dec, VocabSize].
     /// </summary>
-    public override Tensor forward(
-        Tensor src,
-        Tensor tgt,
+    public Tensor Forward(
+        Tensor  src,
+        Tensor  tgt,
         Tensor? srcMask   = null,
         Tensor? tgtMask   = null,
         Tensor? crossMask = null)
     {
         var (encoderOut, encMask) = EncodeText(src, srcMask);
+        using var encD = encoderOut;
         var cm = crossMask ?? encMask;
         return Decode(tgt, encoderOut, tgtMask, cm);
     }
@@ -675,25 +695,25 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor, Tensor?, Ten
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// <summary>
-    /// Mean-pool encoder output over non-padded positions.
+    /// Mean-pool encoder output over non-padded positions → [B, D].
     /// </summary>
     private static Tensor MeanPool(Tensor encoderOut, Tensor? encMask)
     {
         if (encMask is not null)
         {
-            // encMask: [B, 1, 1, T] → squeeze to [B, T]
-            using var mask2d   = encMask.squeeze(1).squeeze(1);            // [B, T]
-            using var maskF    = mask2d.to(encoderOut.dtype);              // [B, T]
-            using var mask3d   = maskF.unsqueeze(2);                       // [B, T, 1]
-            using var masked   = encoderOut * mask3d;                      // [B, T, D]
-            using var summed   = masked.sum(dim: 1);                       // [B, D]
-            using var counts   = maskF.sum(dim: 1, keepdim: true);        // [B, 1]
-            using var safe     = torch.clamp(counts, min: 1.0f);
+            // encMask: [B, 1, 1, T] → [B, T]
+            using var mask2d  = encMask.squeeze(1).squeeze(1);
+            using var maskF   = mask2d.to(encoderOut.dtype);
+            using var mask3d  = maskF.unsqueeze(2);
+            using var masked  = encoderOut * mask3d;
+            using var summed  = masked.sum(new long[] { 1L });
+            using var counts  = maskF.sum(new long[] { 1L }, keepdim: true);
+            using var safe    = counts.clamp_min(1.0f);
             return summed / safe;
         }
         else
         {
-            return encoderOut.mean(dim: [1]);
+            return encoderOut.mean(new long[] { 1L });
         }
     }
 }
