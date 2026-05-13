@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <Optimize>true</Optimize>
+    <RootNamespace>Needle</RootNamespace>
+    <AssemblyName>Needle</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>Simple Attention Network for on-device function calling — .NET 10 port</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SentencePiece tokenizer -->
+    <PackageReference Include="Microsoft.ML.Tokenizers" Version="0.22.0" />
+    <!-- Neural network ops (CPU build; swap for TorchSharp-cuda-* for GPU) -->
+    <PackageReference Include="TorchSharp-cpu" Version="0.103.0" />
+    <!-- SIMD-accelerated tensor primitives (Softmax, Exp, Sum, etc.) -->
+    <PackageReference Include="System.Numerics.Tensors" Version="9.0.0" />
+  </ItemGroup>
+
+</Project>
