@@ -71,6 +71,51 @@ public sealed class LossFunctionTests
         Assert.Equal(1.5f, w[3], precision: 5);
     }
 
+    private static TorchSharp.torch.Tensor L2Normalize(TorchSharp.torch.Tensor x)
+    {
+        using var sq    = x.pow(2);
+        using var sumSq = sq.sum(new long[] { -1L }, keepdim: true);
+        using var denom = (sumSq + 1e-12f).sqrt();
+        return x / denom;
+    }
+
+    [Fact]
+    public void ClipContrastiveLoss_PerfectMatch_NearZero()
+    {
+        // Two identical L2-normalised batches → loss is minimal (cross-entropy on
+        // a diagonal-aligned similarity matrix at temperature 1).
+        TorchSharp.torch.manual_seed(0);
+        using var raw = TorchSharp.torch.randn(4, 8);
+        using var norm = L2Normalize(raw);
+
+        // log_temp = 0 → temperature = 1
+        using var logTemp = TorchSharp.torch.zeros(1);
+        using var loss = LossFunctions.ClipContrastiveLoss(norm, norm, logTemp);
+
+        float v = loss.item<float>();
+        Assert.True(v >= 0f, $"Contrastive loss must be ≥ 0, got {v}");
+        // For B=4, log(B) = 1.386 — perfect-match loss should be well below this.
+        Assert.True(v < (float)System.Math.Log(4) - 0.5f,
+            $"Expected near-zero loss for identical embeddings, got {v}");
+    }
+
+    [Fact]
+    public void ClipContrastiveLoss_RandomPairs_AboveZero()
+    {
+        // Independent random embeddings should produce a loss bounded above 0
+        // (no diagonal structure to exploit).
+        TorchSharp.torch.manual_seed(1);
+        using var qRaw = TorchSharp.torch.randn(8, 16);
+        using var tRaw = TorchSharp.torch.randn(8, 16);
+        using var q = L2Normalize(qRaw);
+        using var t = L2Normalize(tRaw);
+
+        using var logTemp = TorchSharp.torch.zeros(1);
+        using var loss = LossFunctions.ClipContrastiveLoss(q, t, logTemp);
+        float v = loss.item<float>();
+        Assert.True(v > 0f, $"Contrastive loss must be > 0 for random pairs, got {v}");
+    }
+
     [Fact]
     public void TextLoss_AllPaddingMasked_IsZero()
     {

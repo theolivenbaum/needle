@@ -124,7 +124,10 @@ public sealed class Trainer : IDisposable
     public (float TotalLoss, float TextLoss, float GradNorm) TrainStep(TrainingBatch batch)
     {
         _model.train();
-        _adam.zero_grad();
+        // Zero gradients for ALL model parameters. Adam.zero_grad() only zeros
+        // gradients of the parameters Adam owns, leaving Muon-managed weight
+        // gradients to accumulate across steps.
+        _model.zero_grad();
 
         // Move batch to tensors
         using var src     = torch.tensor(batch.SrcTokens.Cast<long>().ToArray(),
