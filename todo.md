@@ -33,14 +33,18 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 ✦ added on branch `claude/test-implement-missing-Xip11`.
 ✱ added on branch `claude/test-implement-missing-G5KET`.
 
-138 xUnit tests pass across all of the above (`dotnet test`).
+143 xUnit tests pass across all of the above (`dotnet test`); the
+five gated tokenizer-parity tests run when `NEEDLE_TOKENIZER_PATH`
+points at a real `needle.model` and are no-ops otherwise.
 
 End-to-end parity against Python on the published checkpoint
 (`Cactus-Compute/needle`) is exercised by the harness in
-`scripts/compare/`.  Greedy generation matches Python token-for-token
-on both spec test queries after fixing two bugs surfaced by that run
-(decode-once in `InferenceRunner.Generate`, and layer-counting in
-`CliEntry.CountLayers`).
+`scripts/compare/`.  The harness reports zero mismatches on the
+spec JSON (4/4 tokenizations exact, 19+14 generated tokens exact,
+retrieval embeddings within tolerance) after fixing three bugs
+surfaced by the run: decode-once in `InferenceRunner.Generate`,
+layer-counting in `CliEntry.CountLayers`, and the SentencePiece
+dummy-prefix mismatch around special tokens in `NeedleTokenizer`.
 
 ## Intentionally NOT ported
 

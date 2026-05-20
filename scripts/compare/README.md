@@ -112,17 +112,23 @@ two real bugs in the .NET port plus one tokenizer edge case:
    checkpoint loaded as a single-layer model.  Fixed in
    `src/Needle.Cli/CliEntry.cs`.
 
-3. **Special-token tokenization drift.**  When encoding a string that
-   begins with a special token (e.g. `<tool_call>[...]`), the Python
-   `NeedleTokenizer` emits a leading SentencePiece space-marker token
-   (id `8041`) before the special token id; the C# wrapper does not.
-   The rest of the sequence agrees.  This is a wrapper-level difference,
-   not a model-level one — left as a known divergence for now (see
-   `spec.json` test case 4).
+3. **Special-token tokenization drift around `<tool_call>` / `<tools>`.**
+   The Microsoft.ML.Tokenizers wrapper splits the input on each
+   special-token literal and SP-encodes each segment independently,
+   producing a fresh ▁ "dummy prefix" per segment.  Python's
+   SentencePiece adds the dummy prefix once at the start of the entire
+   input and treats user-defined symbols as in-stream tokens.  Plus the
+   underlying library has a normalisation quirk that returns `[]` for
+   several short / whitespace-only inputs.  Fixed by replacing the
+   library's specialTokens preprocessing with a manual segmenter in
+   `NeedleTokenizer.Encode` / `Decode` that uses a fixed sentinel prefix
+   (`"ab\n"`, plus an extra space for the dummy-prefix slot) to coax the
+   underlying SP encoder into producing the right pieces.  Locked in by
+   `TokenizerParityTests` (runs when `NEEDLE_TOKENIZER_PATH` is set).
 
-After fix #1 + fix #2, greedy generation on real weights matches
-Python token-for-token on both spec test cases (19 and 14 tokens,
-exact match).
+After all three fixes, the harness reports zero mismatches on the spec
+JSON (4/4 tokenize cases exact, both generations exact 19+14 tokens,
+retrieval embeddings within tolerance).
 
 ## Known limitations
 
