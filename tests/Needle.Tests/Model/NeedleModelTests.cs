@@ -79,6 +79,10 @@ public sealed class NeedleModelTests
     [Fact]
     public void EncodeContrastive_OutputNormalized()
     {
+        // Pin the RNG so initialisation can't unluckily produce an all-negative
+        // pre-ReLU hidden, which would zero out proj and the L2 norm with it.
+        torch.manual_seed(0);
+
         var cfg   = SmallConfig();
         var model = new SimpleAttentionNetwork(cfg);
         model.eval();
