@@ -24,10 +24,14 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 | `training/finetune.py` (JSONL flow) | `Training/JsonlDataset.cs`, `Training/JsonlFinetuner.cs` ✨ |
 | `cli.py` (run/eval/finetune/export) | `src/Needle.Cli/CliEntry.cs` ✨                             |
 | n/a (own binary format)             | `Weights/WeightLoader.cs` (.ndlw + safetensors)            |
+| `training/train.py` (CLIP step)     | `Training/Trainer.cs::TrainStepWithContrastive` ✦          |
+| `dataset/dataset.py` (`pack_sequences`) | `Training/JsonlDataset.cs::BatchBuilder.PackBatch` ✦   |
+| `model/architecture.py` (RoPE cache)| `Model/NeedleModel.cs::GetRope` (per-device cache) ✦       |
 
 ✨ added on branch `claude/investigate-port-gaps-Z1hjA`.
+✦ added on branch `claude/test-implement-missing-Xip11`.
 
-115 xUnit tests pass across all of the above (`dotnet test`).
+124 xUnit tests pass across all of the above (`dotnet test`).
 
 ## Intentionally NOT ported
 
@@ -52,16 +56,9 @@ of an inference / local-finetune .NET runtime:
 
 ## Known smaller gaps still open
 
-- **Contrastive loss in trainer.** The Python `_train_step` mixes a CLIP
-  contrastive loss every 1000 steps (`_contrastive_loss_fn`). The .NET
-  `Trainer.TrainStep` is text-loss only. The building blocks
-  (`SimpleAttentionNetwork.ForwardContrastive`,
-  `LossFunctions.ClipContrastiveLoss`) are in place — wiring them into the
-  train loop is the next obvious step if contrastive retrieval matters.
-- **Multi-example sequence packing.** `BatchBuilder` puts one example per
-  row and pads to the longest row; the Python `pack_sequences` packs
-  multiple examples into one fixed-width row separated by segment IDs.
-  Single-example packing is correct (the segment-aware mask functions
-  collapse to plain padding masks) just less compute-efficient.
-- **RoPE caching.** `SimpleAttentionNetwork` recomputes RoPE on every
-  forward; Python caches per (model, max_gen_len).
+(All previously listed smaller gaps are now closed — see the ✦ rows in the
+table above.  Contrastive loss is now wired into `Trainer` via
+`TrainStepWithContrastive`; multi-example bin packing is implemented in
+`BatchBuilder.PackBatch`/`IteratePacked`; RoPE tables are cached
+per-device on `SimpleAttentionNetwork.GetRope` and grow lazily up to
+`TransformerConfig.MaxSeqLen`.)

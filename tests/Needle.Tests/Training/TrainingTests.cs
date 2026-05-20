@@ -1,4 +1,6 @@
+using Needle.Model;
 using Needle.Training;
+using TorchSharp;
 
 namespace Needle.Tests.Training;
 
@@ -81,6 +83,88 @@ public sealed class LossFunctionTests
         using var segIds   = TorchSharp.torch.zeros(new long[] { 1, 4 }, dtype: TorchSharp.torch.ScalarType.Int32);
         using var loss     = LossFunctions.TextLoss(logits, targets, weights, segIds);
         Assert.Equal(0f, loss.item<float>(), precision: 5);
+    }
+}
+
+public sealed class TrainerContrastiveTests
+{
+    private static TransformerConfig SmallCfg() => new()
+    {
+        VocabSize        = 32,
+        DModel           = 16,
+        NumHeads         = 2,
+        NumKvHeads       = 1,
+        NumEncoderLayers = 1,
+        NumDecoderLayers = 1,
+        DFf              = 16,
+        MaxSeqLen        = 16,
+        ContrastiveDim   = 8,
+        NoFeedforward    = true,
+    };
+
+    private static TrainingBatch SmallTrainingBatch()
+    {
+        int B = 2, encLen = 4, decLen = 4;
+        var src    = new long[B, encLen];
+        var tgtIn  = new long[B, decLen];
+        var tgtOut = new long[B, decLen];
+        var lm     = new int [B, decLen];
+        var encSeg = new int [B, encLen];
+        var decSeg = new int [B, decLen];
+
+        for (int i = 0; i < B; i++)
+            for (int j = 0; j < encLen; j++)
+            {
+                src[i, j]    = (j + i + 1) % 32;
+                encSeg[i, j] = 1;
+            }
+        for (int i = 0; i < B; i++)
+            for (int j = 0; j < decLen; j++)
+            {
+                tgtIn[i, j]  = (j + 2) % 32;
+                tgtOut[i, j] = (j + 3) % 32;
+                decSeg[i, j] = 1;
+                lm[i, j]     = 0;
+            }
+        return new TrainingBatch(src, tgtIn, tgtOut, lm, encSeg, decSeg);
+    }
+
+    [Fact]
+    public void TrainStepWithContrastive_ReturnsFiniteLosses()
+    {
+        var cfg   = SmallCfg();
+        var model = new SimpleAttentionNetwork(cfg);
+        var tcfg  = new TrainingConfig { ContrastiveWeight = 0.1f };
+        using var trainer = new Trainer(model, cfg, tcfg, totalSteps: 5);
+
+        var batch = SmallTrainingBatch();
+        var contrastive = new ContrastiveBatch(
+            QueryTokens: new long[,] { { 1, 2, 3, 4 }, { 5, 6, 7, 8 } },
+            ToolTokens:  new long[,] { { 9, 10, 11, 12 }, { 13, 14, 15, 16 } });
+
+        var (total, text, cl, gnorm) = trainer.TrainStepWithContrastive(batch, contrastive);
+
+        Assert.False(float.IsNaN(total));
+        Assert.False(float.IsNaN(text));
+        Assert.False(float.IsNaN(cl));
+        Assert.True(cl >= 0f, $"Contrastive loss should be non-negative, got {cl}");
+        Assert.True(gnorm >= 0f);
+    }
+
+    [Fact]
+    public void TrainStep_PlainText_StillWorks()
+    {
+        // Sanity: the no-contrastive path remains intact after refactor.
+        var cfg   = SmallCfg();
+        var model = new SimpleAttentionNetwork(cfg);
+        using var trainer = new Trainer(model, cfg, new TrainingConfig(), totalSteps: 3);
+
+        var batch = SmallTrainingBatch();
+        var (total, text, gnorm) = trainer.TrainStep(batch);
+
+        Assert.False(float.IsNaN(total));
+        Assert.False(float.IsNaN(text));
+        Assert.True(gnorm >= 0f);
     }
 }
 

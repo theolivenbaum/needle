@@ -230,4 +230,68 @@ public sealed class BatchBuilderTests
         Assert.Equal(3, batches[1].SrcTokens.GetLength(0));
         Assert.Equal(1, batches[2].SrcTokens.GetLength(0));
     }
+
+    [Fact]
+    public void PackBatch_PacksMultipleExamplesPerRow()
+    {
+        var tk = new FakeTokenizer();
+        // 4 small examples that fit two-per-row at maxEncLen=32.
+        var ex = new FinetuneExample("hi", "[]", """[{"name":"a","arguments":{}}]""");
+        var examples = Enumerable.Range(0, 4).Select(_ => ex).ToList();
+
+        var batch = BatchBuilder.PackBatch(examples, tk, maxEncLen: 32, maxDecLen: 32);
+        Assert.NotNull(batch);
+
+        // All rows are width-32.
+        Assert.Equal(32, batch!.SrcTokens.GetLength(1));
+        Assert.Equal(32, batch.TgtInTokens.GetLength(1));
+
+        // Packing should produce fewer bins than examples (≥ 2 examples per bin).
+        int nBins = batch.SrcTokens.GetLength(0);
+        Assert.True(nBins < 4, $"Expected packing to reduce bins below 4, got {nBins}");
+
+        // At least one row holds two distinct segment IDs (> 1) — proves the
+        // pack actually concatenated two examples.
+        bool foundMultiSegment = false;
+        for (int r = 0; r < nBins; r++)
+        {
+            int maxSeg = 0;
+            for (int j = 0; j < 32; j++) maxSeg = System.Math.Max(maxSeg, batch.EncSegIds[r, j]);
+            if (maxSeg >= 2) { foundMultiSegment = true; break; }
+        }
+        Assert.True(foundMultiSegment, "expected at least one row with two segments");
+    }
+
+    [Fact]
+    public void PackBatch_SegmentIdsContiguousFromOne()
+    {
+        var tk = new FakeTokenizer();
+        var ex = new FinetuneExample("hi", "[]", """[{"name":"a","arguments":{}}]""");
+        var batch = BatchBuilder.PackBatch(
+            new List<FinetuneExample> { ex, ex }, tk, maxEncLen: 32, maxDecLen: 32);
+        Assert.NotNull(batch);
+
+        // First non-zero encoder seg ID in row 0 must be 1.
+        for (int j = 0; j < 32; j++)
+        {
+            if (batch!.EncSegIds[0, j] != 0)
+            {
+                Assert.Equal(1, batch.EncSegIds[0, j]);
+                break;
+            }
+        }
+    }
+
+    [Fact]
+    public void IteratePacked_RespectsBinsPerBatch()
+    {
+        var tk = new FakeTokenizer();
+        var ex = new FinetuneExample("hi", "[]", """[{"name":"a","arguments":{}}]""");
+        var examples = Enumerable.Range(0, 6).Select(_ => ex).ToList();
+        var batches = BatchBuilder.IteratePacked(examples, tk, binsPerBatch: 2,
+                                                  maxEncLen: 32, maxDecLen: 32).ToList();
+
+        foreach (var b in batches)
+            Assert.True(b.SrcTokens.GetLength(0) <= 2);
+    }
 }
