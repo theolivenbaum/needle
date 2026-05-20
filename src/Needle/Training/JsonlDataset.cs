@@ -427,4 +427,165 @@ public static class BatchBuilder
             if (batch is not null) yield return batch;
         }
     }
+
+    /// <summary>
+    /// First-fit-decreasing bin packing of <paramref name="examples"/> into
+    /// fixed-width rows of length (<paramref name="maxEncLen"/>,
+    /// <paramref name="maxDecLen"/>).  Multiple examples are concatenated into
+    /// a single row, separated by incrementing segment IDs.  Per-example
+    /// padding within a row is zero — the segment IDs make
+    /// <see cref="MaskUtils.MakePackingMask"/> and friends produce the right
+    /// block-diagonal masks.
+    ///
+    /// Port of <c>pack_sequences</c> in needle/dataset/dataset.py.
+    /// </summary>
+    /// <param name="examples">Source examples to pack.</param>
+    /// <param name="tokenizer">Tokeniser to use.</param>
+    /// <param name="maxEncLen">Bin width on the encoder side.</param>
+    /// <param name="maxDecLen">Bin width on the decoder side.</param>
+    /// <returns>One <see cref="TrainingBatch"/> whose first dimension is the
+    /// number of packed bins.  Examples that don't fit individually (oversize)
+    /// are dropped (same behaviour as the Python pipeline).</returns>
+    public static TrainingBatch? PackBatch(
+        IList<FinetuneExample> examples,
+        INeedleTokenizer tokenizer,
+        int maxEncLen = 1024,
+        int maxDecLen = 512)
+    {
+        int padId = tokenizer.PadTokenId;
+
+        // Tokenise + sort by encoder length descending (FFD heuristic).
+        var built = new List<FinetuneExampleBuilder.Built>(examples.Count);
+        foreach (var ex in examples)
+        {
+            var b = FinetuneExampleBuilder.Build(tokenizer, ex, maxEncLen, maxDecLen);
+            if (b is null) continue;
+            if (b.EncTokens.Length > maxEncLen || b.DecInTokens.Length > maxDecLen) continue;
+            built.Add(b);
+        }
+        if (built.Count == 0) return null;
+
+        built.Sort((a, b) => b.EncTokens.Length.CompareTo(a.EncTokens.Length));
+
+        // Each bin tracks remaining capacity + the example indices in it.
+        var encRem    = new List<int>();
+        var decRem    = new List<int>();
+        var binItems  = new List<List<int>>();
+
+        for (int i = 0; i < built.Count; i++)
+        {
+            int el = built[i].EncTokens.Length;
+            int dl = System.Math.Max(built[i].DecInTokens.Length, built[i].DecOutTokens.Length);
+
+            int placed = -1;
+            for (int bIdx = 0; bIdx < encRem.Count; bIdx++)
+            {
+                if (encRem[bIdx] >= el && decRem[bIdx] >= dl)
+                {
+                    placed = bIdx;
+                    break;
+                }
+            }
+            if (placed < 0)
+            {
+                encRem.Add(maxEncLen - el);
+                decRem.Add(maxDecLen - dl);
+                binItems.Add(new List<int> { i });
+            }
+            else
+            {
+                encRem[placed] -= el;
+                decRem[placed] -= dl;
+                binItems[placed].Add(i);
+            }
+        }
+
+        int nBins = binItems.Count;
+        var src    = new long[nBins, maxEncLen];
+        var tgtIn  = new long[nBins, maxDecLen];
+        var tgtOut = new long[nBins, maxDecLen];
+        var lm     = new int [nBins, maxDecLen];
+        var encSeg = new int [nBins, maxEncLen];
+        var decSeg = new int [nBins, maxDecLen];
+
+        for (int i = 0; i < nBins; i++) for (int j = 0; j < maxEncLen; j++) src[i, j]    = padId;
+        for (int i = 0; i < nBins; i++) for (int j = 0; j < maxDecLen; j++) tgtIn[i, j]  = padId;
+        for (int i = 0; i < nBins; i++) for (int j = 0; j < maxDecLen; j++) tgtOut[i, j] = padId;
+
+        for (int row = 0; row < nBins; row++)
+        {
+            int encPos = 0;
+            int decPos = 0;
+            int segId  = 1;
+            foreach (int idx in binItems[row])
+            {
+                var b = built[idx];
+                for (int j = 0; j < b.EncTokens.Length; j++)
+                {
+                    src[row, encPos + j]    = b.EncTokens[j];
+                    encSeg[row, encPos + j] = segId;
+                }
+                for (int j = 0; j < b.DecInTokens.Length; j++)
+                    tgtIn[row, decPos + j] = b.DecInTokens[j];
+                for (int j = 0; j < b.DecOutTokens.Length; j++)
+                {
+                    tgtOut[row, decPos + j] = b.DecOutTokens[j];
+                    decSeg[row, decPos + j] = segId;
+                    lm[row, decPos + j]     = b.ClassLabels[j];
+                }
+                encPos += b.EncTokens.Length;
+                decPos += System.Math.Max(b.DecInTokens.Length, b.DecOutTokens.Length);
+                segId  += 1;
+            }
+        }
+
+        return new TrainingBatch(src, tgtIn, tgtOut, lm, encSeg, decSeg);
+    }
+
+    /// <summary>
+    /// Yield packed batches of up to <paramref name="binsPerBatch"/> rows.
+    /// Convenience wrapper around <see cref="PackBatch"/> that lets the
+    /// trainer consume packed bins in fixed-size mini-batches.
+    /// </summary>
+    public static IEnumerable<TrainingBatch> IteratePacked(
+        IList<FinetuneExample> examples,
+        INeedleTokenizer tokenizer,
+        int binsPerBatch,
+        int maxEncLen = 1024,
+        int maxDecLen = 512)
+    {
+        var all = PackBatch(examples, tokenizer, maxEncLen, maxDecLen);
+        if (all is null) yield break;
+
+        int nBins = all.SrcTokens.GetLength(0);
+        for (int start = 0; start < nBins; start += binsPerBatch)
+        {
+            int end = System.Math.Min(start + binsPerBatch, nBins);
+            int B = end - start;
+
+            var src    = new long[B, maxEncLen];
+            var tgtIn  = new long[B, maxDecLen];
+            var tgtOut = new long[B, maxDecLen];
+            var lm     = new int [B, maxDecLen];
+            var encSeg = new int [B, maxEncLen];
+            var decSeg = new int [B, maxDecLen];
+
+            for (int i = 0; i < B; i++)
+            {
+                for (int j = 0; j < maxEncLen; j++)
+                {
+                    src[i, j]    = all.SrcTokens[start + i, j];
+                    encSeg[i, j] = all.EncSegIds[start + i, j];
+                }
+                for (int j = 0; j < maxDecLen; j++)
+                {
+                    tgtIn[i, j]  = all.TgtInTokens[start + i, j];
+                    tgtOut[i, j] = all.TgtOutTokens[start + i, j];
+                    lm[i, j]     = all.LossMask[start + i, j];
+                    decSeg[i, j] = all.DecSegIds[start + i, j];
+                }
+            }
+            yield return new TrainingBatch(src, tgtIn, tgtOut, lm, encSeg, decSeg);
+        }
+    }
 }

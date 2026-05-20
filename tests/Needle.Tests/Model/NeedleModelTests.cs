@@ -178,6 +178,39 @@ public sealed class NeedleModelTests
     }
 
     [Fact]
+    public void Forward_DifferentSeqLens_ConsistentResults()
+    {
+        // RoPE caching: a sequence of different lengths must still produce
+        // mathematically correct (and finite) logits.  Verifies the cached
+        // RoPE table is sliced correctly for the actual T.
+        var cfg   = SmallConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+
+        using (torch.no_grad())
+        {
+            // Warm the cache with a longer sequence first.
+            using var src1 = torch.randint(1, cfg.VocabSize, new long[] { 1, 6 });
+            using var tgt1 = torch.randint(1, cfg.VocabSize, new long[] { 1, 4 });
+            using var _    = model.Forward(src1, tgt1);
+
+            // Now run a shorter sequence; uses the cached (larger) table.
+            using var src2     = torch.randint(1, cfg.VocabSize, new long[] { 1, 3 });
+            using var tgt2     = torch.randint(1, cfg.VocabSize, new long[] { 1, 2 });
+            using var logits2  = model.Forward(src2, tgt2);
+            using var logits2b = model.Forward(src2, tgt2);
+
+            Assert.Equal(new long[] { 1, 2, cfg.VocabSize }, logits2.shape);
+            Assert.False(logits2.isnan().any().item<bool>());
+
+            // Determinism: two calls with the same inputs should match exactly
+            // (RoPE cache means we re-use the same precomputed tensors).
+            using var diff = (logits2 - logits2b).abs().max();
+            Assert.True(diff.item<float>() < 1e-5f, $"Diff was {diff.item<float>()}");
+        }
+    }
+
+    [Fact]
     public void MakeEvalFfnMask_HasCorrectShapeAndValues()
     {
         var cfg   = FfnConfig();

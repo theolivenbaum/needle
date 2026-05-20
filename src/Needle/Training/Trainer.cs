@@ -46,6 +46,16 @@ public sealed record TrainingBatch(
     int[,]  DecSegIds     // [batch, decLen]
 );
 
+/// <summary>
+/// Paired query/tool token batch for the CLIP-style contrastive objective.
+/// Both arrays are [batch, seqLen]; the rows pair positionally (row i of
+/// <see cref="QueryTokens"/> matches row i of <see cref="ToolTokens"/>).
+/// </summary>
+public sealed record ContrastiveBatch(
+    long[,] QueryTokens,
+    long[,] ToolTokens
+);
+
 // ---------------------------------------------------------------------------
 // Trainer
 // ---------------------------------------------------------------------------
@@ -123,6 +133,24 @@ public sealed class Trainer : IDisposable
     /// <returns>(totalLoss, textLoss, gradNorm)</returns>
     public (float TotalLoss, float TextLoss, float GradNorm) TrainStep(TrainingBatch batch)
     {
+        var r = TrainStepInternal(batch, contrastive: null);
+        return (r.TotalLoss, r.TextLoss, r.GradNorm);
+    }
+
+    /// <summary>
+    /// Perform a training step with an additional CLIP-style contrastive loss
+    /// computed from <paramref name="contrastive"/>.  The combined loss is
+    /// <c>text_loss + z_loss + ContrastiveWeight * cl_loss</c> — port of the
+    /// <c>combined_loss</c> branch in <c>_train_step</c> in train.py.
+    /// </summary>
+    /// <returns>(totalLoss, textLoss, contrastiveLoss, gradNorm)</returns>
+    public (float TotalLoss, float TextLoss, float ContrastiveLoss, float GradNorm)
+        TrainStepWithContrastive(TrainingBatch batch, ContrastiveBatch contrastive)
+        => TrainStepInternal(batch, contrastive);
+
+    private (float TotalLoss, float TextLoss, float ContrastiveLoss, float GradNorm)
+        TrainStepInternal(TrainingBatch batch, ContrastiveBatch? contrastive)
+    {
         _model.train();
         _adam.zero_grad();
 
@@ -160,13 +188,45 @@ public sealed class Trainer : IDisposable
         // Text loss + Z-loss
         using var textLoss = LossFunctions.TextLoss(logits, tgtOut, tokenWeights, decSegTensor);
         using var zLoss    = LossFunctions.ZLoss(logits);
-        using var totalLoss = textLoss + zLoss;
 
+        // Optional CLIP contrastive loss.  We keep the intermediates alive
+        // until backward() so the graph stays valid.
+        Tensor? clQueryTokens = null, clToolTokens = null;
+        Tensor? qEmb = null, tEmb = null;
+        Tensor? clLoss = null;
+        float clLossVal = 0f;
+        Tensor totalLossOwned;
+
+        if (contrastive is not null)
+        {
+            long Bcl       = contrastive.QueryTokens.GetLength(0);
+            long qLen      = contrastive.QueryTokens.GetLength(1);
+            long tLen      = contrastive.ToolTokens.GetLength(1);
+            clQueryTokens  = torch.tensor(contrastive.QueryTokens.Cast<long>().ToArray(), new long[] { Bcl, qLen });
+            clToolTokens   = torch.tensor(contrastive.ToolTokens.Cast<long>().ToArray(),  new long[] { Bcl, tLen });
+            var (qe, te, lt) = _model.ForwardContrastive(clQueryTokens, clToolTokens);
+            qEmb = qe; tEmb = te;
+            clLoss = LossFunctions.ClipContrastiveLoss(qEmb, tEmb, lt);
+            clLossVal = clLoss.item<float>();
+            totalLossOwned = textLoss + zLoss + _trainingConfig.ContrastiveWeight * clLoss;
+        }
+        else
+        {
+            totalLossOwned = textLoss + zLoss;
+        }
+
+        using var totalLoss = totalLossOwned;
         float textLossVal  = textLoss.item<float>();
         float totalLossVal = totalLoss.item<float>();
 
         // Backward
         totalLoss.backward();
+
+        clLoss?.Dispose();
+        qEmb?.Dispose();
+        tEmb?.Dispose();
+        clQueryTokens?.Dispose();
+        clToolTokens?.Dispose();
 
         // Collect gradients for Muon parameters (2D/3D kernels)
         var muonGrads = new Dictionary<string, Tensor>();
@@ -194,7 +254,7 @@ public sealed class Trainer : IDisposable
         _muon.Step(muonGrads);
 
         _globalStep++;
-        return (totalLossVal, textLossVal, gradNorm);
+        return (totalLossVal, textLossVal, clLossVal, gradNorm);
     }
 
     // ── Validation step ───────────────────────────────────────────────────────

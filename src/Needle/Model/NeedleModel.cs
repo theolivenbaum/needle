@@ -586,6 +586,12 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
     private readonly TransformerConfig _cfg;
     private readonly float             _embedScale;
 
+    // Per-device RoPE cache. Keyed by device descriptor; entry holds a (cos, sin)
+    // table sized to at least the longest sequence seen so far on that device.
+    // ApplyRope slices to the current T, so a larger table is always usable.
+    private readonly Dictionary<string, (Tensor cos, Tensor sin, long maxLen)> _ropeCache
+        = new();
+
     public readonly Embedding embedding;
     public readonly Encoder   encoder;
     public readonly Decoder   decoder;
@@ -622,17 +628,54 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
     public override Tensor forward(Tensor input) =>
         throw new InvalidOperationException("Use Forward(), EncodeText(), or Decode() instead.");
 
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            foreach (var (_, value) in _ropeCache)
+            {
+                value.cos.Dispose();
+                value.sin.Dispose();
+            }
+            _ropeCache.Clear();
+        }
+        base.Dispose(disposing);
+    }
+
     // ── RoPE helper ───────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Return cached (cos, sin) RoPE tables for the given device.  The cache
+    /// stores tables sized to the largest <paramref name="seqLen"/> seen so far
+    /// on that device; <see cref="RoPE.ApplyRope"/> slices to the actual
+    /// sequence length so a larger table is always usable.
+    ///
+    /// Ownership: the returned tensors are owned by the cache.  Callers MUST
+    /// NOT dispose them.
+    /// </summary>
     private (Tensor cos, Tensor sin) GetRope(long seqLen, Device? device = null)
     {
-        var (cos, sin) = RoPE.PrecomputeFreqs(_cfg.HeadDim, (int)seqLen, _cfg.RopeTheta);
-        if (device is not null)
+        device ??= embedding.weight!.device;
+        string key = $"{device.type}:{device.index}";
+
+        if (_ropeCache.TryGetValue(key, out var entry) && entry.maxLen >= seqLen)
+            return (entry.cos, entry.sin);
+
+        // Grow the table to at least MaxSeqLen so most subsequent calls hit the
+        // cache.  If seqLen exceeds that (long-context inference), use seqLen.
+        long newMaxLen = System.Math.Max(seqLen, _cfg.MaxSeqLen);
+
+        var (cos, sin) = RoPE.PrecomputeFreqs(_cfg.HeadDim, (int)newMaxLen, _cfg.RopeTheta);
+        var cosD = cos.to(device); cos.Dispose();
+        var sinD = sin.to(device); sin.Dispose();
+
+        if (_ropeCache.TryGetValue(key, out var old))
         {
-            var cos2 = cos.to(device); cos.Dispose(); cos = cos2;
-            var sin2 = sin.to(device); sin.Dispose(); sin = sin2;
+            old.cos.Dispose();
+            old.sin.Dispose();
         }
-        return (cos, sin);
+        _ropeCache[key] = (cosD, sinD, newMaxLen);
+        return (cosD, sinD);
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -656,10 +699,7 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
         using var emb  = embedding.forward(src);
         using var embS = emb * _embedScale;
         var rope   = GetRope(src.shape[1], src.device);
-        var result = encoder.Call(embS, srcMask, rope, ffnMask);
-        rope.cos.Dispose();
-        rope.sin.Dispose();
-        return result;
+        return encoder.Call(embS, srcMask, rope, ffnMask);
     }
 
     /// <summary>
@@ -684,8 +724,6 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
         using var embS   = emb * _embedScale;
         var rope         = GetRope(tgt.shape[1], tgt.device);
         using var hidden = decoder.Call(embS, encoderOut, selfMask, crossMask, rope, ffnMask);
-        rope.cos.Dispose();
-        rope.sin.Dispose();
 
         // Tied output projection: logits = hidden @ embedding.weight^T
         using var hidF = hidden.to(ScalarType.Float32);
