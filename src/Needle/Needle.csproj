@@ -22,4 +22,19 @@
     <PackageReference Include="System.Numerics.Tensors" Version="9.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Published SentencePiece model (Cactus-Compute/needle) shipped in-assembly
+         so consumers don't need to download anything to use the default
+         tokenizer.  Loaded via NeedleTokenizer.LoadDefault(). -->
+    <EmbeddedResource Include="Resources\needle.model">
+      <LogicalName>Needle.Resources.needle.model</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Tests reach into the internal downloader to verify the maintenance path
+         still works (downloader stays in-tree as an opt-in refresh utility). -->
+    <InternalsVisibleTo Include="Needle.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -33,10 +33,13 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 ✦ added on branch `claude/test-implement-missing-Xip11`.
 ✱ added on branch `claude/test-implement-missing-G5KET`.
 
-146 xUnit tests pass across all of the above (`dotnet test`); the
-tokenizer-parity tests download `needle.model` from HuggingFace on
-first run via `NeedleTokenizerDownloader` and cache it locally — no
-env var needed.
+147 xUnit tests pass across all of the above (`dotnet test`); the
+tokenizer parity tests run against an embedded copy of the published
+`needle.model` SentencePiece tokenizer (logical resource name
+`Needle.Resources.needle.model`), so no network or env var is required.
+The internal `NeedleTokenizerDownloader` is retained as an opt-in
+maintenance utility for refreshing `src/Needle/Resources/needle.model`
+from HuggingFace.
 
 End-to-end parity against Python on the published checkpoint
 (`Cactus-Compute/needle`) is exercised by the harness in

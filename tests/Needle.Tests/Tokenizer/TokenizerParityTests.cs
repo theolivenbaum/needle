@@ -3,13 +3,10 @@ using Needle.Tokenizer;
 namespace Needle.Tests.Tokenizer;
 
 /// <summary>
-/// End-to-end tokenizer-parity tests against the published SentencePiece
-/// model.  The model file is downloaded from
-/// <c>Cactus-Compute/needle</c> on HuggingFace on first run and cached in
-/// <c>~/.cache/needle/</c> for subsequent runs (override via
-/// <c>NEEDLE_CACHE_DIR</c>).  A pre-downloaded path can be supplied via
-/// <c>NEEDLE_TOKENIZER_PATH</c>; tests skip silently if neither route
-/// produces a model (e.g. offline environment).
+/// End-to-end tokenizer-parity tests against the SentencePiece model
+/// embedded in the Needle assembly (Cactus-Compute/needle, 8 192 pieces).
+/// No network or filesystem path required — the model ships with the
+/// build.
 ///
 /// Locks in the cross-runtime parity behaviour established by the
 /// <c>scripts/compare/</c> harness so the SentencePiece special-token
@@ -17,31 +14,6 @@ namespace Needle.Tests.Tokenizer;
 /// </summary>
 public sealed class TokenizerParityTests
 {
-    /// <summary>
-    /// Resolved once per test class.  Honours the env-var override, then
-    /// falls back to a cached / freshly-downloaded copy.  Null when the
-    /// model is unavailable (offline, download failed, etc.).
-    /// </summary>
-    private static readonly string? _modelPath = ResolveModelPath();
-
-    private static string? ResolveModelPath()
-    {
-        var env = Environment.GetEnvironmentVariable("NEEDLE_TOKENIZER_PATH");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-
-        try
-        {
-            return NeedleTokenizerDownloader.EnsureTokenizerModel();
-        }
-        catch
-        {
-            // Offline, download failed, etc. — tests will silently skip.
-            return null;
-        }
-    }
-
-    private static bool ModelAvailable => _modelPath is not null;
-
     /// <summary>
     /// Reference token sequences produced by the Python
     /// <c>NeedleTokenizer.encode()</c> (i.e. SentencePiece's
@@ -75,9 +47,7 @@ public sealed class TokenizerParityTests
     [MemberData(nameof(ParityCases))]
     public void Encode_MatchesPython(string text, int[] expected)
     {
-        if (!ModelAvailable) return; // tokenizer model not provided; skip silently
-
-        using var tok = new NeedleTokenizer(_modelPath!);
+        using var tok = NeedleTokenizer.LoadDefault();
         var actual = tok.Encode(text);
         Assert.Equal(expected, actual.ToArray());
     }
@@ -85,13 +55,18 @@ public sealed class TokenizerParityTests
     [Fact]
     public void RoundTrip_ContainsSpecialTokenLiterals()
     {
-        if (!ModelAvailable) return; // tokenizer model not provided; skip silently
-
-        using var tok = new NeedleTokenizer(_modelPath!);
+        using var tok = NeedleTokenizer.LoadDefault();
         var ids = tok.Encode("<tool_call>{\"name\":\"x\"}");
         string decoded = tok.Decode(ids);
 
         Assert.StartsWith("<tool_call>", decoded);
         Assert.Contains("\"name\":\"x\"", decoded);
+    }
+
+    [Fact]
+    public void LoadDefault_VocabSize_MatchesPython()
+    {
+        using var tok = NeedleTokenizer.LoadDefault();
+        Assert.Equal(8192, tok.VocabSize);
     }
 }

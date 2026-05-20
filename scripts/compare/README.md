@@ -124,7 +124,8 @@ two real bugs in the .NET port plus one tokenizer edge case:
    `NeedleTokenizer.Encode` / `Decode` that uses a fixed sentinel prefix
    (`"ab\n"`, plus an extra space for the dummy-prefix slot) to coax the
    underlying SP encoder into producing the right pieces.  Locked in by
-   `TokenizerParityTests` (runs when `NEEDLE_TOKENIZER_PATH` is set).
+   `TokenizerParityTests` (runs against the embedded model — no env var
+   needed).
 
 4. **Attention mask used `float.NegativeInfinity` instead of `finfo.min`.**
    A fully-masked query row (e.g. a padded slot in a packed batch)
@@ -143,13 +144,13 @@ exact, batched generation exact, retrieval embeddings within
 tolerance, training-step loss within bf16 vs fp32 drift, INT4 fake-
 quantization exact to float32 precision.
 
-The five tokenizer parity tests no longer need
-`NEEDLE_TOKENIZER_PATH` — `NeedleTokenizerDownloader.EnsureTokenizerModel()`
-fetches `needle.model` from HuggingFace on first run and caches it in
-`~/.local/share/needle/` (Linux/macOS) or `%LOCALAPPDATA%\needle\`
-(Windows).  Override the cache location with `NEEDLE_CACHE_DIR`.  The
-env-var path is still honoured if set, and the tests skip silently if
-both the env var is unset and the download fails (offline CI).
+The tokenizer parity tests are network-free: the published SentencePiece
+model (`needle.model`, ~125 KB) is shipped as an embedded resource in
+`Needle.dll` under the logical name `Needle.Resources.needle.model`, and
+`NeedleTokenizer.LoadDefault()` reads it directly out of the assembly.
+The internal `NeedleTokenizerDownloader` is retained as an opt-in
+maintenance utility for refreshing `src/Needle/Resources/needle.model`
+from HuggingFace, but no runtime code path depends on it.
 
 ## Known limitations
 

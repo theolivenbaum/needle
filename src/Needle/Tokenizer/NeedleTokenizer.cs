@@ -26,10 +26,10 @@ public sealed class NeedleTokenizer : INeedleTokenizer, IDisposable
 
     // ── Internals ────────────────────────────────────────────────────────────
 
-    private readonly SentencePieceTokenizer _sp;
+    private SentencePieceTokenizer _sp = null!;
 
     /// <summary>Reverse lookup: ID → raw piece string (e.g. "▁hello").</summary>
-    private readonly string[] _idToPiece;
+    private string[] _idToPiece = null!;
 
     /// <summary>
     /// Special-token literals in priority order (longer first to avoid
@@ -42,14 +42,14 @@ public sealed class NeedleTokenizer : INeedleTokenizer, IDisposable
     };
 
     /// <summary>Set of special-token IDs for fast membership checks in Decode.</summary>
-    private readonly HashSet<int> _specialIds;
+    private HashSet<int> _specialIds = null!;
 
     /// <summary>
     /// ID of the lone SentencePiece space marker "▁".  Cached at construction
     /// for use as the dummy-prefix token when manually segmenting input around
     /// special tokens.
     /// </summary>
-    private readonly int _spaceId;
+    private int _spaceId;
 
     // ── Properties ───────────────────────────────────────────────────────────
 
@@ -65,6 +65,12 @@ public sealed class NeedleTokenizer : INeedleTokenizer, IDisposable
     // ── Construction ─────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Logical resource name of the embedded SentencePiece model
+    /// (Cactus-Compute/needle, 8 192 pieces, ~125 KB).
+    /// </summary>
+    internal const string EmbeddedResourceName = "Needle.Resources.needle.model";
+
+    /// <summary>
     /// Load the SentencePiece model from <paramref name="modelPath"/>.
     /// </summary>
     /// <param name="modelPath">Path to the .model file.</param>
@@ -73,6 +79,38 @@ public sealed class NeedleTokenizer : INeedleTokenizer, IDisposable
         if (!File.Exists(modelPath))
             throw new FileNotFoundException($"SentencePiece model not found: {modelPath}", modelPath);
 
+        using var stream = File.OpenRead(modelPath);
+        InitFromStream(stream);
+    }
+
+    /// <summary>
+    /// Load the SentencePiece model from an open <paramref name="modelStream"/>.
+    /// The caller owns the stream and may dispose it after this constructor
+    /// returns.
+    /// </summary>
+    public NeedleTokenizer(Stream modelStream)
+    {
+        ArgumentNullException.ThrowIfNull(modelStream);
+        InitFromStream(modelStream);
+    }
+
+    /// <summary>
+    /// Build a tokenizer from the SentencePiece model embedded in the assembly
+    /// (the published Cactus-Compute/needle model).  No file or network access
+    /// required.
+    /// </summary>
+    public static NeedleTokenizer LoadDefault()
+    {
+        using var stream = typeof(NeedleTokenizer).Assembly
+            .GetManifestResourceStream(EmbeddedResourceName)
+            ?? throw new InvalidOperationException(
+                $"Embedded tokenizer resource '{EmbeddedResourceName}' not found in assembly. " +
+                "Was the project built with the Resources/needle.model file present?");
+        return new NeedleTokenizer(stream);
+    }
+
+    private void InitFromStream(Stream modelStream)
+    {
         // Note: we deliberately do NOT pass `specialTokens` to LlamaTokenizer.
         // Microsoft.ML.Tokenizers' special-token preprocessing splits the input
         // around each literal and encodes each segment independently — and each
@@ -81,9 +119,8 @@ public sealed class NeedleTokenizer : INeedleTokenizer, IDisposable
         // prefix once at the start of the input and treats special tokens as
         // user-defined symbols inside the SP encoder).  We do our own
         // segmentation in Encode() / Decode() below.
-        using var stream = File.OpenRead(modelPath);
         _sp = LlamaTokenizer.Create(
-            stream,
+            modelStream,
             addBeginOfSentence: false,
             addEndOfSentence:   false);
 

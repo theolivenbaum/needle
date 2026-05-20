@@ -26,17 +26,18 @@ public static class CliEntry
         needle — Simple Attention Network for on-device function calling
 
         Usage:
-          needle run           --checkpoint <path> --tokenizer <path> [--query <text>] [--tools <json>]
-          needle eval          --checkpoint <path> --tokenizer <path> --jsonl <path>
-          needle finetune      --checkpoint <path> --tokenizer <path> --jsonl <path> [--epochs N]
+          needle run           --checkpoint <path> [--tokenizer <path>] [--query <text>] [--tools <json>]
+          needle eval          --checkpoint <path> [--tokenizer <path>] --jsonl <path>
+          needle finetune      --checkpoint <path> [--tokenizer <path>] --jsonl <path> [--epochs N]
           needle export        --checkpoint <path> --factor N --output <path>
-          needle dump-compare  --checkpoint <path> --tokenizer <path> --spec <path> --out <path>
+          needle dump-compare  --checkpoint <path> [--tokenizer <path>] --spec <path> --out <path>
 
         Notes:
           * --checkpoint should be a .ndlw or .safetensors file (pickle .pkl is
             not supported on the .NET port).
-          * --tokenizer should point to a SentencePiece .model file matching the
-            checkpoint.
+          * --tokenizer is optional: if omitted, the SentencePiece model
+            embedded in the Needle assembly (Cactus-Compute/needle) is used.
+            Pass an explicit .model file only when overriding it.
           * dump-compare reads a JSON spec and writes deterministic outputs
             (tokenization, generation, retrieval embeddings) for diffing
             against the Python reference.  See scripts/compare/README.md.
@@ -85,7 +86,7 @@ public static class CliEntry
     {
         var opts = ArgParser.Parse(args);
         string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
+        string tokPath    = opts.Get("tokenizer", "");
         string query      = opts.Get("query", "What is the weather in San Francisco?");
         string tools      = opts.Get("tools", """[{"name":"get_weather","parameters":{"location":"string"}}]""");
         int maxLen        = int.Parse(opts.Get("max-len", "512"));
@@ -118,7 +119,7 @@ public static class CliEntry
     {
         var opts = ArgParser.Parse(args);
         string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
+        string tokPath    = opts.Get("tokenizer", "");
         string jsonlPath  = opts.GetRequired("jsonl");
         int maxGenLen     = int.Parse(opts.Get("max-gen-len", "512"));
         int maxEncLen     = int.Parse(opts.Get("max-enc-len", "1024"));
@@ -178,7 +179,7 @@ public static class CliEntry
     {
         var opts = ArgParser.Parse(args);
         string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
+        string tokPath    = opts.Get("tokenizer", "");
         string jsonlPath  = opts.GetRequired("jsonl");
         int epochs        = int.Parse(opts.Get("epochs",     "1"));
         int batchSize     = int.Parse(opts.Get("batch-size", "8"));
@@ -282,7 +283,7 @@ public static class CliEntry
     {
         var opts = ArgParser.Parse(args);
         string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
+        string tokPath    = opts.Get("tokenizer", "");
         string specPath   = opts.GetRequired("spec");
         string outPath    = opts.GetRequired("out");
         int floatPrec     = int.Parse(opts.Get("float-precision", "8"));
@@ -686,8 +687,14 @@ public static class CliEntry
 
     // ── Loading helpers ──────────────────────────────────────────────────────
 
-    private static NeedleTokenizer LoadTokenizer(string path)
+    /// <summary>
+    /// Load a SentencePiece tokenizer.  An empty/null <paramref name="path"/>
+    /// uses the model embedded in the Needle assembly (no file required).
+    /// </summary>
+    private static NeedleTokenizer LoadTokenizer(string? path)
     {
+        if (string.IsNullOrEmpty(path))
+            return NeedleTokenizer.LoadDefault();
         if (!File.Exists(path))
             throw new FileNotFoundException($"Tokenizer model not found: {path}", path);
         return new NeedleTokenizer(path);
