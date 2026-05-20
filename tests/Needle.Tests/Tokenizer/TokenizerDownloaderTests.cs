@@ -3,8 +3,12 @@ using Needle.Tokenizer;
 namespace Needle.Tests.Tokenizer;
 
 /// <summary>
-/// Smoke tests for <see cref="NeedleTokenizerDownloader"/>.  Skipped
-/// silently when no network access is available.
+/// Smoke tests for <see cref="NeedleTokenizerDownloader"/>, the internal
+/// maintenance utility used to refresh the embedded
+/// <c>Resources/needle.model</c>.  Skipped silently when no network access
+/// is available; runtime tokenizer loading goes through
+/// <c>NeedleTokenizer.LoadDefault()</c> and does not depend on the
+/// downloader.
 /// </summary>
 public sealed class TokenizerDownloaderTests
 {

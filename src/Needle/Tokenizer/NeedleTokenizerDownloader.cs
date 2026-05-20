@@ -6,11 +6,12 @@ namespace Needle.Tokenizer;
 /// <summary>
 /// Downloads the published <c>needle.model</c> SentencePiece tokenizer
 /// from the Cactus-Compute/needle HuggingFace repository and caches it on
-/// disk for reuse.  This is the .NET equivalent of the
-/// <c>get_tokenizer()</c> / <c>_download_tokenizer_from_hf()</c> path in
-/// <c>needle/dataset/tokenizer.py</c>.
+/// disk for reuse.  Kept as a maintenance utility for refreshing the
+/// embedded <c>Resources/needle.model</c>; the runtime path is
+/// <see cref="NeedleTokenizer.LoadDefault"/>, which reads the embedded
+/// resource and needs no network.
 /// </summary>
-public static class NeedleTokenizerDownloader
+internal static class NeedleTokenizerDownloader
 {
     private const string HuggingFaceRepo  = "Cactus-Compute/needle";
     private const string TokenizerSubpath = "tokenizer/needle.model";
@@ -24,7 +25,7 @@ public static class NeedleTokenizerDownloader
     /// <c>%LOCALAPPDATA%\needle</c> on Windows.  Can be overridden by
     /// setting the <c>NEEDLE_CACHE_DIR</c> environment variable.
     /// </summary>
-    public static string DefaultCacheDir
+    internal static string DefaultCacheDir
     {
         get
         {
@@ -54,7 +55,7 @@ public static class NeedleTokenizerDownloader
     /// </param>
     /// <returns>Absolute path to the cached <c>needle.model</c> file.</returns>
     /// <exception cref="HttpRequestException">Download failed.</exception>
-    public static string EnsureTokenizerModel(string? cacheDir = null)
+    internal static string EnsureTokenizerModel(string? cacheDir = null)
     {
         cacheDir ??= DefaultCacheDir;
         string localPath = Path.Combine(cacheDir, FileName);
@@ -108,7 +109,7 @@ public static class NeedleTokenizerDownloader
     /// Convenience wrapper that combines <see cref="EnsureTokenizerModel"/>
     /// with <see cref="NeedleTokenizer"/> construction.
     /// </summary>
-    public static NeedleTokenizer LoadOrDownload(string? cacheDir = null) =>
+    internal static NeedleTokenizer LoadOrDownload(string? cacheDir = null) =>
         new NeedleTokenizer(EnsureTokenizerModel(cacheDir));
 
     private static bool IsValidLocalFile(string path)
