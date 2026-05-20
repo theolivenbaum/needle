@@ -1,0 +1,37 @@
+{
+  "tokenize": [
+    {"text": "Hello world"},
+    {"text": "What's the weather in San Francisco?"},
+    {"text": "[{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]"},
+    {"text": "<tool_call>[{\"name\":\"get_weather\",\"arguments\":{\"location\":\"SF\"}}]"}
+  ],
+  "generate": [
+    {
+      "id":           "weather_sf",
+      "query":        "What's the weather in San Francisco?",
+      "tools":        "[{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]",
+      "max_gen_len":  128,
+      "max_enc_len":  512,
+      "constrained":  false,
+      "normalize":    false
+    },
+    {
+      "id":           "time_paris",
+      "query":        "What time is it in Paris?",
+      "tools":        "[{\"name\":\"get_time\",\"parameters\":{\"location\":\"string\"}}]",
+      "max_gen_len":  128,
+      "max_enc_len":  512,
+      "constrained":  false,
+      "normalize":    false
+    }
+  ],
+  "encode_retrieval": {
+    "max_len": 256,
+    "texts": [
+      "What's the weather like?",
+      "{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}",
+      "{\"name\":\"send_email\",\"parameters\":{\"to\":\"string\",\"body\":\"string\"}}",
+      "Send a message to Alice"
+    ]
+  }
+}

@@ -1,3 +1,6 @@
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Needle.Inference;
 using Needle.Model;
 using Needle.Tokenizer;
@@ -23,16 +26,20 @@ public static class CliEntry
         needle — Simple Attention Network for on-device function calling
 
         Usage:
-          needle run       --checkpoint <path> --tokenizer <path> [--query <text>] [--tools <json>]
-          needle eval      --checkpoint <path> --tokenizer <path> --jsonl <path>
-          needle finetune  --checkpoint <path> --tokenizer <path> --jsonl <path> [--epochs N]
-          needle export    --checkpoint <path> --factor N --output <path>
+          needle run           --checkpoint <path> --tokenizer <path> [--query <text>] [--tools <json>]
+          needle eval          --checkpoint <path> --tokenizer <path> --jsonl <path>
+          needle finetune      --checkpoint <path> --tokenizer <path> --jsonl <path> [--epochs N]
+          needle export        --checkpoint <path> --factor N --output <path>
+          needle dump-compare  --checkpoint <path> --tokenizer <path> --spec <path> --out <path>
 
         Notes:
           * --checkpoint should be a .ndlw or .safetensors file (pickle .pkl is
             not supported on the .NET port).
           * --tokenizer should point to a SentencePiece .model file matching the
             checkpoint.
+          * dump-compare reads a JSON spec and writes deterministic outputs
+            (tokenization, generation, retrieval embeddings) for diffing
+            against the Python reference.  See scripts/compare/README.md.
 
         For full documentation see README.md.
         """;
@@ -50,10 +57,11 @@ public static class CliEntry
         {
             return args[0] switch
             {
-                "run"      => RunInference(rest),
-                "eval"     => RunEval(rest),
-                "finetune" => RunFinetune(rest),
-                "export"   => RunExport(rest),
+                "run"          => RunInference(rest),
+                "eval"         => RunEval(rest),
+                "finetune"     => RunFinetune(rest),
+                "export"       => RunExport(rest),
+                "dump-compare" => RunDumpCompare(rest),
                 _ => UnknownCommand(args[0]),
             };
         }
@@ -260,6 +268,172 @@ public static class CliEntry
         }
         throw new InvalidOperationException(
             "Could not infer DFf — no gate_proj.weight tensor found in checkpoint.");
+    }
+
+    // ── needle dump-compare ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Read a JSON spec describing test inputs (tokenization, generation,
+    /// retrieval) and write a deterministic JSON dump of the C# outputs, for
+    /// numerical diffing against the Python reference.  See
+    /// scripts/compare/README.md.
+    /// </summary>
+    private static int RunDumpCompare(string[] args)
+    {
+        var opts = ArgParser.Parse(args);
+        string checkpoint = opts.GetRequired("checkpoint");
+        string tokPath    = opts.GetRequired("tokenizer");
+        string specPath   = opts.GetRequired("spec");
+        string outPath    = opts.GetRequired("out");
+        int floatPrec     = int.Parse(opts.Get("float-precision", "8"));
+
+        if (!File.Exists(specPath))
+            throw new FileNotFoundException($"Spec file not found: {specPath}", specPath);
+
+        var specRoot = JsonNode.Parse(File.ReadAllText(specPath))
+            ?? throw new InvalidOperationException("Empty or invalid spec JSON.");
+
+        var tokenizer = LoadTokenizer(tokPath);
+        var output    = new JsonObject();
+
+        // ── Tokenization tests ──────────────────────────────────────────────
+        if (specRoot["tokenize"] is JsonArray tokSpec)
+        {
+            var outArr = new JsonArray();
+            foreach (var item in tokSpec)
+            {
+                string text = item?["text"]?.GetValue<string>()
+                              ?? throw new InvalidOperationException("tokenize.text missing");
+                var ids   = tokenizer.Encode(text);
+                var entry = new JsonObject
+                {
+                    ["text"]    = text,
+                    ["ids"]     = new JsonArray([.. ids.Select(i => JsonValue.Create(i))]),
+                    ["decoded"] = tokenizer.Decode(ids),
+                };
+                outArr.Add(entry);
+            }
+            output["tokenize"] = outArr;
+        }
+
+        // Generation and retrieval both need the model; skip loading if neither
+        // section is present (tokenizer-only diffs don't need weights).
+        bool needsModel =
+            specRoot["generate"]         is JsonArray ||
+            specRoot["encode_retrieval"] is JsonObject;
+
+        if (needsModel)
+        {
+            var (model, config) = LoadModel(checkpoint);
+            try
+            {
+                using var runner = new InferenceRunner(model, tokenizer, config);
+
+                // ── Generation tests ─────────────────────────────────────────
+                if (specRoot["generate"] is JsonArray genSpec)
+                {
+                    var outArr = new JsonArray();
+                    foreach (var item in genSpec)
+                    {
+                        if (item is not JsonObject obj)
+                            throw new InvalidOperationException("generate items must be objects.");
+
+                        string id          = obj["id"]?.GetValue<string>() ?? "";
+                        string query       = obj["query"]?.GetValue<string>()
+                                              ?? throw new InvalidOperationException("generate.query missing");
+                        string tools       = obj["tools"]?.GetValue<string>() ?? "[]";
+                        int    maxGen      = obj["max_gen_len"]?.GetValue<int>() ?? 128;
+                        int    maxEnc      = obj["max_enc_len"]?.GetValue<int>() ?? 1024;
+                        bool   constrained = obj["constrained"]?.GetValue<bool>() ?? false;
+                        bool   normalize   = obj["normalize"]?.GetValue<bool>() ?? false;
+
+                        // Capture the actual generated token IDs (in addition
+                        // to the decoded text), so the comparator can diff
+                        // them deterministically.
+                        var pieces = new List<string>();
+                        IProgress<string> sink = new Progress<string>(p => pieces.Add(p));
+
+                        string text = runner.Generate(
+                            query:      query,
+                            tools:      tools,
+                            maxGenLen:  maxGen,
+                            maxEncLen:  maxEnc,
+                            normalize:  normalize,
+                            constrained: constrained,
+                            progress:   sink);
+
+                        // Re-encode the produced text to get the canonical ID
+                        // list (mirrors what the Python comparator can produce).
+                        var producedIds = tokenizer.Encode(text);
+
+                        var entry = new JsonObject
+                        {
+                            ["id"]     = id,
+                            ["query"]  = query,
+                            ["text"]   = text,
+                            ["ids"]    = new JsonArray([.. producedIds.Select(i => JsonValue.Create(i))]),
+                            ["pieces"] = new JsonArray([.. pieces.Select(p => JsonValue.Create(p))]),
+                        };
+                        outArr.Add(entry);
+                    }
+                    output["generate"] = outArr;
+                }
+
+                // ── Retrieval-embedding tests ────────────────────────────────
+                if (specRoot["encode_retrieval"] is JsonObject retSpec)
+                {
+                    int maxLen = retSpec["max_len"]?.GetValue<int>() ?? 256;
+                    var texts  = (retSpec["texts"] as JsonArray)
+                                 ?? throw new InvalidOperationException("encode_retrieval.texts missing");
+                    var textList = texts.Select(t => t?.GetValue<string>() ?? "").ToList();
+
+                    float[,] embs = runner.EncodeForRetrieval(textList, maxLen: maxLen);
+                    int N = embs.GetLength(0);
+                    int D = embs.GetLength(1);
+
+                    var embArr = new JsonArray();
+                    string fmt = $"F{floatPrec}";
+                    for (int i = 0; i < N; i++)
+                    {
+                        var row = new JsonArray();
+                        for (int j = 0; j < D; j++)
+                            row.Add(JsonValue.Create(System.Math.Round(embs[i, j], floatPrec)));
+                        embArr.Add(row);
+                    }
+
+                    output["encode_retrieval"] = new JsonObject
+                    {
+                        ["shape"]      = new JsonArray(N, D),
+                        ["texts"]      = new JsonArray([.. textList.Select(t => JsonValue.Create(t))]),
+                        ["embeddings"] = embArr,
+                    };
+                }
+            }
+            finally
+            {
+                (model as IDisposable)?.Dispose();
+            }
+        }
+
+        // Header so the comparator can sanity-check the side it's reading.
+        output["meta"] = new JsonObject
+        {
+            ["side"]            = "csharp",
+            ["checkpoint"]      = checkpoint,
+            ["tokenizer"]       = tokPath,
+            ["float_precision"] = floatPrec,
+        };
+
+        tokenizer.Dispose();
+
+        var serializerOpts = new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder       = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
+        File.WriteAllText(outPath, output.ToJsonString(serializerOpts));
+        Console.WriteLine($"wrote {outPath}");
+        return 0;
     }
 
     // ── Loading helpers ──────────────────────────────────────────────────────
