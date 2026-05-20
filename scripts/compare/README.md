@@ -92,6 +92,38 @@ divergent tokens later.  The comparator reports the first divergence
 position and the prefixes either side — useful for triage, but not a
 clean pass/fail unless you opt in with `--token-strict`.
 
+## Findings from the first end-to-end run
+
+Running this harness against the published `Cactus-Compute/needle`
+checkpoint (`d=512`, `12/8` enc/dec layers, contrastive_dim 128) surfaced
+two real bugs in the .NET port plus one tokenizer edge case:
+
+1. **`InferenceRunner.Generate` decoded the buffer only once.**  The
+   autoregressive loop reused the same logits tensor across every
+   position, so predictions ignored anything appended after the initial
+   pass.  `GenerateBatch` re-decoded each step and was fine.  Fixed in
+   `src/Needle/Inference/Runner.cs`; regression test
+   `NeedleModelTests.Decode_LogitsDependOnPriorDecoderTokens` covers the
+   underlying property.
+
+2. **`CliEntry.CountLayers` didn't recognise the TorchSharp ModuleList
+   naming.**  It looked for `encoder.layer_<n>` but `named_parameters()`
+   emits `encoder._layers.<n>`, so a freshly converted safetensors
+   checkpoint loaded as a single-layer model.  Fixed in
+   `src/Needle.Cli/CliEntry.cs`.
+
+3. **Special-token tokenization drift.**  When encoding a string that
+   begins with a special token (e.g. `<tool_call>[...]`), the Python
+   `NeedleTokenizer` emits a leading SentencePiece space-marker token
+   (id `8041`) before the special token id; the C# wrapper does not.
+   The rest of the sequence agrees.  This is a wrapper-level difference,
+   not a model-level one — left as a known divergence for now (see
+   `spec.json` test case 4).
+
+After fix #1 + fix #2, greedy generation on real weights matches
+Python token-for-token on both spec test cases (19 and 14 tokens,
+exact match).
+
 ## Known limitations
 
 - **bfloat16 vs float32.**  The Python reference runs in bfloat16 by

@@ -113,6 +113,54 @@ public sealed class NeedleModelTests
         Assert.False(logits.isinf().any().item<bool>(), "Logits contain Inf");
     }
 
+    [Fact]
+    public void Decode_LogitsDependOnPriorDecoderTokens()
+    {
+        // Regression test for a bug where InferenceRunner.Generate ran
+        // model.Decode once before the autoregressive loop and reused the same
+        // logits tensor for every step.  Greedy decoding then degenerated
+        // because the predicted token at position i+1 never depended on the
+        // tokens appended at positions 1..i.
+        //
+        // This test asserts the property that broke under that bug: changing
+        // a decoder-side token at position 1 must change the logits the model
+        // produces at position 1 (and beyond).
+        var cfg   = SmallConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+        using var noGrad = torch.no_grad();
+
+        const int Td = 6;
+        int padId = 0;
+        int eosId = 1;
+
+        using var encOut  = torch.randn(1, 4, cfg.DModel);
+        using var tgtMask = MaskUtils.MakeCausalMask(Td);
+
+        // Buffer A: [EOS, PAD, PAD, PAD, PAD, PAD]
+        using var bufA = torch.full(new long[] { 1, Td }, padId, dtype: ScalarType.Int64);
+        bufA[0, 0] = eosId;
+
+        // Buffer B: [EOS, 7, PAD, PAD, PAD, PAD] — same as A but with one
+        // extra "generated" token at position 1.
+        using var bufB = bufA.clone();
+        bufB[0, 1] = 7L;
+
+        using var logitsA = model.Decode(bufA, encOut, tgtMask);
+        using var logitsB = model.Decode(bufB, encOut, tgtMask);
+
+        // Logits at position 1 differ between A and B because position 1's
+        // input differs.  (Position 0 sees the same input in both, so its
+        // logits should match.)
+        using var diffPos1 = (logitsA[0, 1] - logitsB[0, 1]).abs().max();
+        Assert.True(diffPos1.item<float>() > 1e-3f,
+            $"Decoder is not position-sensitive — autoregressive decoding will degenerate (max diff {diffPos1.item<float>()}).");
+
+        using var diffPos0 = (logitsA[0, 0] - logitsB[0, 0]).abs().max();
+        Assert.True(diffPos0.item<float>() < 1e-4f,
+            $"Causal mask leaked: position 0 logits should match (max diff {diffPos0.item<float>()}).");
+    }
+
     private static TransformerConfig FfnConfig() => SmallConfig() with { NoFeedforward = false };
 
     [Fact]

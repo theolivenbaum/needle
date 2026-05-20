@@ -100,10 +100,7 @@ def main() -> int:
                 )
                 # Re-encode the produced text so both sides emit canonical ID lists.
                 ids = list(tokenizer.encode(text))
-                pieces = [tokenizer.id_to_piece(i)
-                          if hasattr(tokenizer, "id_to_piece")
-                          else tokenizer.sp_model.IdToPiece(i)
-                          for i in ids]
+                pieces = [tokenizer.sp.id_to_piece(i) for i in ids]
                 out_gen.append({
                     "id":     item.get("id", ""),
                     "query":  item["query"],

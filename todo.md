@@ -33,7 +33,14 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 ✦ added on branch `claude/test-implement-missing-Xip11`.
 ✱ added on branch `claude/test-implement-missing-G5KET`.
 
-137 xUnit tests pass across all of the above (`dotnet test`).
+138 xUnit tests pass across all of the above (`dotnet test`).
+
+End-to-end parity against Python on the published checkpoint
+(`Cactus-Compute/needle`) is exercised by the harness in
+`scripts/compare/`.  Greedy generation matches Python token-for-token
+on both spec test queries after fixing two bugs surfaced by that run
+(decode-once in `InferenceRunner.Generate`, and layer-counting in
+`CliEntry.CountLayers`).
 
 ## Intentionally NOT ported
 

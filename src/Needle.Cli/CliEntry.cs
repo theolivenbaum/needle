@@ -501,16 +501,24 @@ public static class CliEntry
 
     private static int CountLayers(IReadOnlyDictionary<string, Tensor> tensors, string stack)
     {
+        // Accept both the historical `<stack>.layer_<n>` naming and the
+        // TorchSharp ModuleList naming `<stack>._layers.<n>` that the actual
+        // model emits via named_parameters().
+        string[] prefixes = [$"{stack}._layers.", $"{stack}.layer_"];
         int max = -1;
         foreach (var name in tensors.Keys)
         {
-            int idx = name.IndexOf($"{stack}.layer_", StringComparison.Ordinal);
-            if (idx < 0) continue;
-            int start = idx + $"{stack}.layer_".Length;
-            int end   = start;
-            while (end < name.Length && char.IsDigit(name[end])) end++;
-            if (end > start && int.TryParse(name.AsSpan(start, end - start), out int n))
-                if (n > max) max = n;
+            foreach (var prefix in prefixes)
+            {
+                int idx = name.IndexOf(prefix, StringComparison.Ordinal);
+                if (idx < 0) continue;
+                int start = idx + prefix.Length;
+                int end   = start;
+                while (end < name.Length && char.IsDigit(name[end])) end++;
+                if (end > start && int.TryParse(name.AsSpan(start, end - start), out int n))
+                    if (n > max) max = n;
+                break;
+            }
         }
         return System.Math.Max(1, max + 1);
     }

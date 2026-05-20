@@ -117,39 +117,53 @@ public sealed class InferenceRunner : IDisposable
 
         var generated = new List<int>();
 
-        // Initial decode pass over the full buffer
-        using var logits = _model.Decode(decBuffer, encoderOut, tgtMask, encMask);
+        // Greedy auto-regressive decode: re-run the decoder over the full
+        // buffer after each token is appended.  This mirrors the Python
+        // reference (run.py).  There's no KV cache, so each iteration is
+        // O(L) in the buffer length; the cost is acceptable for the
+        // 32M-param model and small generation lengths.
+        Tensor logits = _model.Decode(decBuffer, encoderOut, tgtMask, encMask);
 
-        for (int i = 0; i < maxGenLen - 1; i++)
+        try
         {
-            // logits shape: [1, maxGenLen, vocabSize] — take position i
-            using var stepLogits = logits[0, i];   // [vocabSize]
-
-            int nextToken;
-            if (cd is not null && cd.IsActive(0))
+            for (int i = 0; i < maxGenLen - 1; i++)
             {
-                float[] logitsArr = stepLogits.data<float>().ToArray();
-                float[] masked    = cd.ConstrainLogits(logitsArr, 0);
-                nextToken = ArgmaxFloat(masked);
+                using var stepLogits = logits[0, i];   // [vocabSize]
+
+                int nextToken;
+                if (cd is not null && cd.IsActive(0))
+                {
+                    float[] logitsArr = stepLogits.data<float>().ToArray();
+                    float[] masked    = cd.ConstrainLogits(logitsArr, 0);
+                    nextToken = ArgmaxFloat(masked);
+                }
+                else
+                {
+                    nextToken = (int)stepLogits.argmax().item<long>();
+                }
+
+                cd?.Update(0, nextToken);
+
+                if (nextToken == eosId) break;
+
+                generated.Add(nextToken);
+                decBuffer[0, i + 1] = nextToken;
+
+                string piece = _tokenizer.IdToPiece(nextToken);
+                progress?.Report(piece);
+
+                // Re-run the decoder with the updated buffer for the next
+                // position's logits.
+                logits.Dispose();
+                logits = _model.Decode(decBuffer, encoderOut, tgtMask, encMask);
             }
-            else
-            {
-                nextToken = (int)stepLogits.argmax().item<long>();
-            }
-
-            cd?.Update(0, nextToken);
-
-            if (nextToken == eosId) break;
-
-            generated.Add(nextToken);
-            decBuffer[0, i + 1] = nextToken;
-
-            string piece = _tokenizer.IdToPiece(nextToken);
-            progress?.Report(piece);
         }
-
-        encoderOut.Dispose();
-        decBuffer.Dispose();
+        finally
+        {
+            logits.Dispose();
+            encoderOut.Dispose();
+            decBuffer.Dispose();
+        }
 
         string result = _tokenizer.Decode(generated);
         if (result.StartsWith("<tool_call>", StringComparison.Ordinal))

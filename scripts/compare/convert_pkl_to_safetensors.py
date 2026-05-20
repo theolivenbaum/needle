@@ -191,7 +191,15 @@ def main() -> int:
             slice_t = t[li]
             if is_kernel:
                 slice_t = slice_t.t().contiguous()
-            key = f"{stack}.layer_{li}.{cs_tail}"
+            # Scalar gate params (attn_gate, self_attn_gate, cross_attn_gate)
+            # are stored as () in Flax but as Parameter(zeros(1)) — i.e. shape
+            # (1,) — in the .NET model, so reshape singletons up to a 1-D
+            # tensor here.
+            if slice_t.ndim == 0:
+                slice_t = slice_t.reshape(1)
+            # C# uses `_layers.<i>` (TorchSharp ModuleList registers under the
+            # backing-field name plus index), not `layer_<i>`.
+            key = f"{stack}._layers.{li}.{cs_tail}"
             out_tensors[key] = slice_t.to(target_dtype)
 
     if skipped:
