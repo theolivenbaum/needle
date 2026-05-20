@@ -130,6 +130,14 @@ After all three fixes, the harness reports zero mismatches on the spec
 JSON (4/4 tokenize cases exact, both generations exact 19+14 tokens,
 retrieval embeddings within tolerance).
 
+The five tokenizer parity tests no longer need
+`NEEDLE_TOKENIZER_PATH` — `NeedleTokenizerDownloader.EnsureTokenizerModel()`
+fetches `needle.model` from HuggingFace on first run and caches it in
+`~/.local/share/needle/` (Linux/macOS) or `%LOCALAPPDATA%\needle\`
+(Windows).  Override the cache location with `NEEDLE_CACHE_DIR`.  The
+env-var path is still honoured if set, and the tests skip silently if
+both the env var is unset and the download fails (offline CI).
+
 ## Known limitations
 
 - **bfloat16 vs float32.**  The Python reference runs in bfloat16 by

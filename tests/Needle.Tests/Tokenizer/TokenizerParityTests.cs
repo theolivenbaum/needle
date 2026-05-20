@@ -4,21 +4,43 @@ namespace Needle.Tests.Tokenizer;
 
 /// <summary>
 /// End-to-end tokenizer-parity tests against the published SentencePiece
-/// model.  These require the actual <c>needle.model</c> file from
-/// <c>Cactus-Compute/needle</c>; they are skipped unless the model path is
-/// provided via the <c>NEEDLE_TOKENIZER_PATH</c> environment variable.
+/// model.  The model file is downloaded from
+/// <c>Cactus-Compute/needle</c> on HuggingFace on first run and cached in
+/// <c>~/.cache/needle/</c> for subsequent runs (override via
+/// <c>NEEDLE_CACHE_DIR</c>).  A pre-downloaded path can be supplied via
+/// <c>NEEDLE_TOKENIZER_PATH</c>; tests skip silently if neither route
+/// produces a model (e.g. offline environment).
 ///
 /// Locks in the cross-runtime parity behaviour established by the
-/// <c>scripts/compare/</c> harness (tokenize section of <c>spec.json</c>)
-/// so the SentencePiece special-token quirks the .NET wrapper had to work
-/// around can't silently regress.
+/// <c>scripts/compare/</c> harness so the SentencePiece special-token
+/// quirks the .NET wrapper had to work around can't silently regress.
 /// </summary>
 public sealed class TokenizerParityTests
 {
-    private static string? ModelPath =>
-        Environment.GetEnvironmentVariable("NEEDLE_TOKENIZER_PATH");
+    /// <summary>
+    /// Resolved once per test class.  Honours the env-var override, then
+    /// falls back to a cached / freshly-downloaded copy.  Null when the
+    /// model is unavailable (offline, download failed, etc.).
+    /// </summary>
+    private static readonly string? _modelPath = ResolveModelPath();
 
-    private static bool ModelAvailable => !string.IsNullOrEmpty(ModelPath) && File.Exists(ModelPath);
+    private static string? ResolveModelPath()
+    {
+        var env = Environment.GetEnvironmentVariable("NEEDLE_TOKENIZER_PATH");
+        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+
+        try
+        {
+            return NeedleTokenizerDownloader.EnsureTokenizerModel();
+        }
+        catch
+        {
+            // Offline, download failed, etc. — tests will silently skip.
+            return null;
+        }
+    }
+
+    private static bool ModelAvailable => _modelPath is not null;
 
     /// <summary>
     /// Reference token sequences produced by the Python
@@ -55,7 +77,7 @@ public sealed class TokenizerParityTests
     {
         if (!ModelAvailable) return; // tokenizer model not provided; skip silently
 
-        using var tok = new NeedleTokenizer(ModelPath!);
+        using var tok = new NeedleTokenizer(_modelPath!);
         var actual = tok.Encode(text);
         Assert.Equal(expected, actual.ToArray());
     }
@@ -65,7 +87,7 @@ public sealed class TokenizerParityTests
     {
         if (!ModelAvailable) return; // tokenizer model not provided; skip silently
 
-        using var tok = new NeedleTokenizer(ModelPath!);
+        using var tok = new NeedleTokenizer(_modelPath!);
         var ids = tok.Encode("<tool_call>{\"name\":\"x\"}");
         string decoded = tok.Decode(ids);
 
