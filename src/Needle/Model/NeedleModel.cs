@@ -248,7 +248,17 @@ public sealed class FeedForward : Module<Tensor, Tensor>
         RegisterComponents();
     }
 
-    public override Tensor forward(Tensor x)
+    public override Tensor forward(Tensor x) => Call(x, ffnMask: null);
+
+    /// <summary>
+    /// Feed-forward with an optional per-batch FFN mask.
+    /// </summary>
+    /// <param name="x">Input [B, T, D].</param>
+    /// <param name="ffnMask">
+    /// Optional [B, dFf] float mask multiplied into the gated hidden activations
+    /// before the down projection.  Used by matryoshka FFN training.
+    /// </param>
+    public Tensor Call(Tensor x, Tensor? ffnMask)
     {
         using var gate = gate_proj.forward(x);
         using var up   = up_proj.forward(x);
@@ -275,6 +285,16 @@ public sealed class FeedForward : Module<Tensor, Tensor>
                 h = rg * ru;
                 break;
             }
+        }
+
+        if (ffnMask is not null)
+        {
+            // ffnMask: [B, dFf] → [B, 1, dFf] broadcasts across the T axis.
+            using var maskCast = ffnMask.to(h.dtype);
+            using var maskB    = maskCast.unsqueeze(1);
+            var product = h * maskB;
+            h.Dispose();
+            h = product;
         }
 
         using var hD = h;
@@ -334,7 +354,11 @@ public sealed class EncoderBlock : Module<Tensor, Tensor>
     public override Tensor forward(Tensor input) =>
         throw new InvalidOperationException("Use the explicit Call() overload.");
 
-    public Tensor Call(Tensor x, Tensor? mask, (Tensor cos, Tensor sin)? rope)
+    public Tensor Call(
+        Tensor x,
+        Tensor? mask,
+        (Tensor cos, Tensor sin)? rope,
+        Tensor? ffnMask = null)
     {
         // Self-attention sublayer with scalar gated residual
         using var g1      = torch.sigmoid(attn_gate).squeeze();
@@ -347,7 +371,7 @@ public sealed class EncoderBlock : Module<Tensor, Tensor>
 
         using var g2      = torch.sigmoid(ffn_gate!).squeeze();
         using var normed2 = ffn_norm!.forward(h);
-        using var ffnOut  = ffn.forward(normed2);
+        using var ffnOut  = ffn.Call(normed2, ffnMask);
         using var hD      = h;
         return hD + g2 * ffnOut;
     }
@@ -385,11 +409,12 @@ public sealed class Encoder : Module<Tensor, Tensor>
     public (Tensor output, Tensor? mask) Call(
         Tensor x,
         Tensor? mask,
-        (Tensor cos, Tensor sin)? rope)
+        (Tensor cos, Tensor sin)? rope,
+        Tensor? ffnMask = null)
     {
         foreach (var layer in _layers)
         {
-            var next = layer.Call(x, mask, rope);
+            var next = layer.Call(x, mask, rope, ffnMask);
             x.Dispose();
             x = next;
         }
@@ -467,7 +492,8 @@ public sealed class DecoderBlock : Module<Tensor, Tensor>
         Tensor  encoderOut,
         Tensor? selfMask,
         Tensor? crossMask,
-        (Tensor cos, Tensor sin)? rope)
+        (Tensor cos, Tensor sin)? rope,
+        Tensor? ffnMask = null)
     {
         // Self-attention
         using var sg  = torch.sigmoid(self_attn_gate).squeeze();
@@ -487,7 +513,7 @@ public sealed class DecoderBlock : Module<Tensor, Tensor>
 
         using var fg  = torch.sigmoid(ffn_gate!).squeeze();
         using var fn2 = ffn_norm!.forward(h);
-        using var fo  = ffn.forward(fn2);
+        using var fo  = ffn.Call(fn2, ffnMask);
         using var hD2 = h;
         return hD2 + fg * fo;
     }
@@ -527,11 +553,12 @@ public sealed class Decoder : Module<Tensor, Tensor>
         Tensor  encoderOut,
         Tensor? selfMask,
         Tensor? crossMask,
-        (Tensor cos, Tensor sin)? rope)
+        (Tensor cos, Tensor sin)? rope,
+        Tensor? ffnMask = null)
     {
         foreach (var layer in _layers)
         {
-            var next = layer.Call(x, encoderOut, selfMask, crossMask, rope);
+            var next = layer.Call(x, encoderOut, selfMask, crossMask, rope, ffnMask);
             x.Dispose();
             x = next;
         }
@@ -615,13 +642,21 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
     /// </summary>
     /// <param name="src">Token IDs [B, T_enc] (int64).</param>
     /// <param name="srcMask">Optional attention mask [B, 1, 1, T_enc] (bool).</param>
+    /// <param name="ffnMask">
+    /// Optional per-batch-item FFN activation mask [B, dFf] (float).  When given
+    /// it is multiplied into the FFN hidden activations of every encoder block —
+    /// the matryoshka-FFN path used by <see cref="ForwardMasked"/>.
+    /// </param>
     /// <returns>(encoderOutput [B, T_enc, D], mask)</returns>
-    public (Tensor encoderOut, Tensor? encMask) EncodeText(Tensor src, Tensor? srcMask = null)
+    public (Tensor encoderOut, Tensor? encMask) EncodeText(
+        Tensor src,
+        Tensor? srcMask = null,
+        Tensor? ffnMask = null)
     {
         using var emb  = embedding.forward(src);
         using var embS = emb * _embedScale;
         var rope   = GetRope(src.shape[1], src.device);
-        var result = encoder.Call(embS, srcMask, rope);
+        var result = encoder.Call(embS, srcMask, rope, ffnMask);
         rope.cos.Dispose();
         rope.sin.Dispose();
         return result;
@@ -634,17 +669,21 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
     /// <param name="encoderOut">Encoder hidden states [B, T_enc, D].</param>
     /// <param name="selfMask">Optional causal mask [B, 1, T_dec, T_dec] (bool).</param>
     /// <param name="crossMask">Optional cross-attention mask [B, 1, T_dec, T_enc] (bool).</param>
+    /// <param name="ffnMask">
+    /// Optional per-batch-item FFN activation mask [B, dFf] (float).
+    /// </param>
     /// <returns>Logits [B, T_dec, VocabSize] (float32).</returns>
     public Tensor Decode(
         Tensor  tgt,
         Tensor  encoderOut,
         Tensor? selfMask  = null,
-        Tensor? crossMask = null)
+        Tensor? crossMask = null,
+        Tensor? ffnMask   = null)
     {
         using var emb    = embedding.forward(tgt);
         using var embS   = emb * _embedScale;
         var rope         = GetRope(tgt.shape[1], tgt.device);
-        using var hidden = decoder.Call(embS, encoderOut, selfMask, crossMask, rope);
+        using var hidden = decoder.Call(embS, encoderOut, selfMask, crossMask, rope, ffnMask);
         rope.cos.Dispose();
         rope.sin.Dispose();
 
@@ -690,6 +729,70 @@ public sealed class SimpleAttentionNetwork : Module<Tensor, Tensor>
         using var encD = encoderOut;
         var cm = crossMask ?? encMask;
         return Decode(tgt, encoderOut, tgtMask, cm);
+    }
+
+    /// <summary>
+    /// Encoder-decoder forward pass with a per-batch FFN mask applied to both
+    /// stacks.  Used by matryoshka-FFN training.  Port of
+    /// <c>SimpleAttentionNetwork.forward_masked</c> in architecture.py.
+    /// </summary>
+    /// <param name="src">Source token IDs [B, T_enc] (int64).</param>
+    /// <param name="tgt">Target token IDs [B, T_dec] (int64).</param>
+    /// <param name="srcMask">Optional encoder attention mask.</param>
+    /// <param name="tgtMask">Optional decoder self-attention mask.</param>
+    /// <param name="crossMask">Optional decoder cross-attention mask.</param>
+    /// <param name="ffnMask">
+    /// Per-batch FFN activation mask [B, dFf].  Required.
+    /// </param>
+    /// <returns>Logits [B, T_dec, VocabSize] (float32).</returns>
+    public Tensor ForwardMasked(
+        Tensor  src,
+        Tensor  tgt,
+        Tensor  ffnMask,
+        Tensor? srcMask   = null,
+        Tensor? tgtMask   = null,
+        Tensor? crossMask = null)
+    {
+        var (encoderOut, encMask) = EncodeText(src, srcMask, ffnMask);
+        using var encD = encoderOut;
+        var cm = crossMask ?? encMask;
+        return Decode(tgt, encoderOut, tgtMask, cm, ffnMask);
+    }
+
+    /// <summary>
+    /// Contrastive twin-encoder forward.  Encodes <paramref name="queryTokens"/>
+    /// and <paramref name="toolTokens"/> independently and returns their
+    /// L2-normalised projections together with the learnable log-temperature.
+    /// Port of <c>SimpleAttentionNetwork.forward_contrastive</c>.
+    /// </summary>
+    public (Tensor qEmb, Tensor tEmb, Tensor logTemp) ForwardContrastive(
+        Tensor queryTokens,
+        Tensor toolTokens)
+    {
+        var qEmb = EncodeContrastive(queryTokens);
+        var tEmb = EncodeContrastive(toolTokens);
+        return (qEmb, tEmb, log_temp);
+    }
+
+    /// <summary>
+    /// Build the default prefix FFN mask for matryoshka eval at a single
+    /// FFN width.  Sets the first <paramref name="ffWidth"/> neurons to 1.0
+    /// and the rest to 0.0, broadcast across the batch.
+    /// Port of <c>_make_eval_ffn_mask</c> in architecture.py.
+    /// </summary>
+    /// <param name="ffWidth">Number of FFN neurons to keep active.</param>
+    /// <param name="batchSize">Batch dimension to broadcast to.</param>
+    /// <param name="device">Optional device for the returned tensor.</param>
+    public Tensor MakeEvalFfnMask(int ffWidth, long batchSize, Device? device = null)
+    {
+        if (ffWidth < 0 || ffWidth > _cfg.DFf)
+            throw new ArgumentOutOfRangeException(nameof(ffWidth),
+                $"ffWidth must be in [0, {_cfg.DFf}].");
+
+        using var arange = torch.arange(_cfg.DFf, device: device ?? embedding.weight!.device);
+        using var lt     = arange.lt(ffWidth);
+        using var asF    = lt.to(ScalarType.Float32);
+        return asF.unsqueeze(0).expand(batchSize, _cfg.DFf).contiguous();
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

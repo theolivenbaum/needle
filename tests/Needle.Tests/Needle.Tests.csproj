@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Needle\Needle.csproj" />
+    <ProjectReference Include="..\..\src\Needle.Cli\Needle.Cli.csproj" />
   </ItemGroup>
 
   <ItemGroup>

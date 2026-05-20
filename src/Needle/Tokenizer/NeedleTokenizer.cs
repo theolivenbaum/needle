@@ -13,7 +13,7 @@ namespace Needle.Tokenizer;
 ///
 /// Port of needle/dataset/tokenizer.py.
 /// </summary>
-public sealed class NeedleTokenizer : IDisposable
+public sealed class NeedleTokenizer : INeedleTokenizer, IDisposable
 {
     // ── Special token IDs ────────────────────────────────────────────────────
 
