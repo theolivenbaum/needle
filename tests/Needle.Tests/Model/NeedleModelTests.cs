@@ -112,4 +112,83 @@ public sealed class NeedleModelTests
         Assert.False(logits.isnan().any().item<bool>(), "Logits contain NaN");
         Assert.False(logits.isinf().any().item<bool>(), "Logits contain Inf");
     }
+
+    private static TransformerConfig FfnConfig() => SmallConfig() with { NoFeedforward = false };
+
+    [Fact]
+    public void ForwardMasked_ZeroFfnMask_StillProducesLogits()
+    {
+        var cfg   = FfnConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+
+        int B = 1, Te = 3, Td = 2;
+        using var src     = torch.randint(1, cfg.VocabSize, new long[] { B, Te });
+        using var tgt     = torch.randint(1, cfg.VocabSize, new long[] { B, Td });
+        using var ffnMask = torch.zeros(new long[] { B, cfg.DFf });
+        using var logits  = model.ForwardMasked(src, tgt, ffnMask);
+
+        Assert.Equal(new long[] { B, Td, cfg.VocabSize }, logits.shape);
+        Assert.False(logits.isnan().any().item<bool>());
+    }
+
+    [Fact]
+    public void ForwardMasked_FullFfnMask_MatchesForward()
+    {
+        // With an all-ones FFN mask the masked forward should equal the
+        // unmasked forward up to numerical noise.
+        var cfg   = FfnConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+
+        int B = 1, Te = 3, Td = 2;
+        using var src     = torch.randint(1, cfg.VocabSize, new long[] { B, Te });
+        using var tgt     = torch.randint(1, cfg.VocabSize, new long[] { B, Td });
+        using var ffnMask = torch.ones(new long[] { B, cfg.DFf });
+
+        using var lUnmasked = model.Forward(src, tgt);
+        using var lMasked   = model.ForwardMasked(src, tgt, ffnMask);
+
+        using var diff = (lUnmasked - lMasked).abs().max();
+        Assert.True(diff.item<float>() < 1e-4f, $"Diff was {diff.item<float>()}");
+    }
+
+    [Fact]
+    public void ForwardContrastive_ReturnsBothEmbeddingsAndLogTemp()
+    {
+        var cfg   = SmallConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+
+        using var q = torch.randint(1, cfg.VocabSize, new long[] { 2, 4 });
+        using var t = torch.randint(1, cfg.VocabSize, new long[] { 2, 5 });
+
+        var (qe, te, lt) = model.ForwardContrastive(q, t);
+        try
+        {
+            Assert.Equal(new long[] { 2, cfg.ContrastiveDim }, qe.shape);
+            Assert.Equal(new long[] { 2, cfg.ContrastiveDim }, te.shape);
+            Assert.Equal(new long[] { 1 }, lt.shape);
+        }
+        finally
+        {
+            qe.Dispose();
+            te.Dispose();
+        }
+    }
+
+    [Fact]
+    public void MakeEvalFfnMask_HasCorrectShapeAndValues()
+    {
+        var cfg   = FfnConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+
+        using var mask = model.MakeEvalFfnMask(ffWidth: cfg.DFf / 2, batchSize: 3);
+        Assert.Equal(new long[] { 3, cfg.DFf }, mask.shape);
+
+        // First half = 1.0, second half = 0.0
+        float[] row = mask[0].data<float>().ToArray();
+        for (int i = 0; i < cfg.DFf / 2; i++) Assert.Equal(1f, row[i], precision: 5);
+        for (int i = cfg.DFf / 2; i < cfg.DFf; i++) Assert.Equal(0f, row[i], precision: 5);
+    }
 }
