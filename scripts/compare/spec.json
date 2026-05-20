@@ -1,0 +1,111 @@
+{
+  "tokenize": [
+    {"text": "Hello world"},
+    {"text": "What's the weather in San Francisco?"},
+    {"text": "[{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]"},
+    {"text": "<tool_call>[{\"name\":\"get_weather\",\"arguments\":{\"location\":\"SF\"}}]"}
+  ],
+  "tool_normalize": [
+    "[{\"name\":\"getWeather\",\"parameters\":{\"location\":\"string\"}}]",
+    "[{\"name\":\"HTTPRequest\",\"parameters\":{\"url\":\"string\"}},{\"name\":\"send_email\",\"parameters\":{\"to\":\"string\"}}]",
+    "[{\"name\":\"already_snake\"}]",
+    "not valid json"
+  ],
+  "generate": [
+    {
+      "id":           "weather_sf",
+      "query":        "What's the weather in San Francisco?",
+      "tools":        "[{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]",
+      "max_gen_len":  128,
+      "max_enc_len":  512,
+      "constrained":  false,
+      "normalize":    false
+    },
+    {
+      "id":           "time_paris",
+      "query":        "What time is it in Paris?",
+      "tools":        "[{\"name\":\"get_time\",\"parameters\":{\"location\":\"string\"}}]",
+      "max_gen_len":  128,
+      "max_enc_len":  512,
+      "constrained":  false,
+      "normalize":    false
+    },
+    {
+      "id":           "weather_sf_constrained",
+      "query":        "What's the weather in San Francisco?",
+      "tools":        "[{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]",
+      "max_gen_len":  128,
+      "max_enc_len":  512,
+      "constrained":  true,
+      "normalize":    false
+    },
+    {
+      "id":           "weather_sf_normalized",
+      "query":        "What's the weather in San Francisco?",
+      "tools":        "[{\"name\":\"getWeather\",\"parameters\":{\"location\":\"string\"}}]",
+      "max_gen_len":  128,
+      "max_enc_len":  512,
+      "constrained":  false,
+      "normalize":    true
+    }
+  ],
+  "generate_batch": [
+    {
+      "id":          "two_queries",
+      "items": [
+        {"query": "What's the weather in San Francisco?",
+         "tools": "[{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]"},
+        {"query": "Send a message to Alice",
+         "tools": "[{\"name\":\"send_message\",\"parameters\":{\"to\":\"string\",\"body\":\"string\"}}]"}
+      ],
+      "max_gen_len": 128,
+      "max_enc_len": 512,
+      "constrained": false,
+      "normalize":   false
+    }
+  ],
+  "encode_retrieval": {
+    "max_len": 256,
+    "texts": [
+      "What's the weather like?",
+      "{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}",
+      "{\"name\":\"send_email\",\"parameters\":{\"to\":\"string\",\"body\":\"string\"}}",
+      "Send a message to Alice"
+    ]
+  },
+  "forward_loss": {
+    "_comment":   "Deterministic fixed-input forward pass to verify training-time loss math (text CE with class weights + Z-loss).  Same weights, same inputs, same loss within numeric tolerance.",
+    "src_tokens": [
+      [4279, 8066, 8046, 302, 1149, 362, 711, 327, 0, 0],
+      [1149, 362, 7318, 363, 5338, 745, 0, 0, 0, 0]
+    ],
+    "tgt_in_tokens": [
+      [1, 356, 294, 264, 358, 8062],
+      [1, 8071, 271, 294, 264, 358]
+    ],
+    "tgt_out_tokens": [
+      [356, 294, 264, 358, 8062, 1331],
+      [8071, 271, 294, 264, 358, 8062]
+    ],
+    "loss_mask": [
+      [0, 1, 1, 1, 2, 2],
+      [0, 0, 1, 1, 2, 3]
+    ],
+    "enc_seg_ids": [
+      [1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+      [1, 1, 1, 1, 1, 1, 0, 0, 0, 0]
+    ],
+    "dec_seg_ids": [
+      [1, 1, 1, 1, 1, 1],
+      [1, 1, 1, 1, 1, 1]
+    ]
+  },
+  "quantize": {
+    "_comment":   "Apply group-wise INT4 fake-quant to a slice of a real model weight; compare element-wise.",
+    "tensor_key": "embedding.weight",
+    "rows":       [0, 256],
+    "cols":       [0, 64],
+    "group_size": 32,
+    "precision":  "int4"
+  }
+}

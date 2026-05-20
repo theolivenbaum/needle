@@ -96,6 +96,63 @@ public sealed class NeedleModelTests
     }
 
     [Fact]
+    public void Forward_PackedBatchWithPadding_NoNaNLogits()
+    {
+        // Regression for an attention bug: the mask used float.NegativeInfinity
+        // to block disallowed positions, so a fully-masked query row (e.g. a
+        // padded slot in a packed batch) produced softmax = NaN, which then
+        // poisoned the encoder output via matmul.  Python uses finfo.min — a
+        // large but finite negative — and the .NET side has to match.
+        var cfg   = SmallConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+        using var noGrad = torch.no_grad();
+
+        const int B  = 2;
+        const int Te = 6;
+        const int Td = 4;
+
+        // Both rows have padding at the tail of the encoder input.
+        var srcArr = new long[,]
+        {
+            { 11, 12, 13, 14,  0,  0 },   // 2 pad tokens
+            { 21, 22, 23,  0,  0,  0 },   // 3 pad tokens
+        };
+        var encSegArr = new int[,]
+        {
+            { 1, 1, 1, 1, 0, 0 },
+            { 1, 1, 1, 0, 0, 0 },
+        };
+        var tgtArr = new long[,]
+        {
+            { 1, 5, 6, 7 },
+            { 1, 8, 9, 0 },
+        };
+        var decSegArr = new int[,]
+        {
+            { 1, 1, 1, 1 },
+            { 1, 1, 1, 0 },
+        };
+
+        using var src    = torch.tensor(srcArr.Cast<long>().ToArray(), new long[] { B, Te });
+        using var tgt    = torch.tensor(tgtArr.Cast<long>().ToArray(), new long[] { B, Td });
+        using var encSeg = torch.tensor(encSegArr.Cast<int>().ToArray(),
+                                         new long[] { B, Te }, dtype: ScalarType.Int32);
+        using var decSeg = torch.tensor(decSegArr.Cast<int>().ToArray(),
+                                         new long[] { B, Td }, dtype: ScalarType.Int32);
+
+        using var srcMask   = MaskUtils.MakePackingMask(encSeg);
+        using var tgtMask   = MaskUtils.MakeCausalPackingMask(decSeg);
+        using var crossMask = MaskUtils.MakeCrossPackingMask(encSeg, decSeg);
+
+        using var logits = model.Forward(src, tgt, srcMask, tgtMask, crossMask);
+
+        Assert.Equal(new long[] { B, Td, cfg.VocabSize }, logits.shape);
+        Assert.False(logits.isnan().any().item<bool>(), "Logits contain NaN — attention mask is using -inf instead of finfo.min.");
+        Assert.False(logits.isinf().any().item<bool>(), "Logits contain Inf — attention mask is using -inf instead of finfo.min.");
+    }
+
+    [Fact]
     public void Forward_FullPass_ProducesLogits()
     {
         var cfg   = SmallConfig();
@@ -111,6 +168,54 @@ public sealed class NeedleModelTests
         // Logits should be finite
         Assert.False(logits.isnan().any().item<bool>(), "Logits contain NaN");
         Assert.False(logits.isinf().any().item<bool>(), "Logits contain Inf");
+    }
+
+    [Fact]
+    public void Decode_LogitsDependOnPriorDecoderTokens()
+    {
+        // Regression test for a bug where InferenceRunner.Generate ran
+        // model.Decode once before the autoregressive loop and reused the same
+        // logits tensor for every step.  Greedy decoding then degenerated
+        // because the predicted token at position i+1 never depended on the
+        // tokens appended at positions 1..i.
+        //
+        // This test asserts the property that broke under that bug: changing
+        // a decoder-side token at position 1 must change the logits the model
+        // produces at position 1 (and beyond).
+        var cfg   = SmallConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+        using var noGrad = torch.no_grad();
+
+        const int Td = 6;
+        int padId = 0;
+        int eosId = 1;
+
+        using var encOut  = torch.randn(1, 4, cfg.DModel);
+        using var tgtMask = MaskUtils.MakeCausalMask(Td);
+
+        // Buffer A: [EOS, PAD, PAD, PAD, PAD, PAD]
+        using var bufA = torch.full(new long[] { 1, Td }, padId, dtype: ScalarType.Int64);
+        bufA[0, 0] = eosId;
+
+        // Buffer B: [EOS, 7, PAD, PAD, PAD, PAD] — same as A but with one
+        // extra "generated" token at position 1.
+        using var bufB = bufA.clone();
+        bufB[0, 1] = 7L;
+
+        using var logitsA = model.Decode(bufA, encOut, tgtMask);
+        using var logitsB = model.Decode(bufB, encOut, tgtMask);
+
+        // Logits at position 1 differ between A and B because position 1's
+        // input differs.  (Position 0 sees the same input in both, so its
+        // logits should match.)
+        using var diffPos1 = (logitsA[0, 1] - logitsB[0, 1]).abs().max();
+        Assert.True(diffPos1.item<float>() > 1e-3f,
+            $"Decoder is not position-sensitive — autoregressive decoding will degenerate (max diff {diffPos1.item<float>()}).");
+
+        using var diffPos0 = (logitsA[0, 0] - logitsB[0, 0]).abs().max();
+        Assert.True(diffPos0.item<float>() < 1e-4f,
+            $"Causal mask leaked: position 0 logits should match (max diff {diffPos0.item<float>()}).");
     }
 
     private static TransformerConfig FfnConfig() => SmallConfig() with { NoFeedforward = false };

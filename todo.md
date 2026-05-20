@@ -21,6 +21,7 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 | `model/export.py`                   | `Weights/SubmodelExport.cs` ✨                              |
 | `training/eval.py` (tool-call F1)   | `Inference/ToolCallMetrics.cs` ✨                           |
 | `training/eval.py` (perplexity)     | `Training/PerplexityEval.cs` ✨                             |
+| `training/eval.py` (throughput, repetition, generation-quality, WER, retrieval Recall@k / MRR) | `Inference/GenerationBenchmarks.cs` ✱ |
 | `training/finetune.py` (JSONL flow) | `Training/JsonlDataset.cs`, `Training/JsonlFinetuner.cs` ✨ |
 | `cli.py` (run/eval/finetune/export) | `src/Needle.Cli/CliEntry.cs` ✨                             |
 | n/a (own binary format)             | `Weights/WeightLoader.cs` (.ndlw + safetensors)            |
@@ -30,8 +31,33 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 
 ✨ added on branch `claude/investigate-port-gaps-Z1hjA`.
 ✦ added on branch `claude/test-implement-missing-Xip11`.
+✱ added on branch `claude/test-implement-missing-G5KET`.
 
-124 xUnit tests pass across all of the above (`dotnet test`).
+146 xUnit tests pass across all of the above (`dotnet test`); the
+tokenizer-parity tests download `needle.model` from HuggingFace on
+first run via `NeedleTokenizerDownloader` and cache it locally — no
+env var needed.
+
+End-to-end parity against Python on the published checkpoint
+(`Cactus-Compute/needle`) is exercised by the harness in
+`scripts/compare/`.  The harness reports zero mismatches on the
+spec JSON across:
+
+  * tokenize (4/4 exact)
+  * tool-name normalization (4/4 exact)
+  * generation (4 cases, incl. constrained and tool-name normalized)
+  * batched generation (2 items exact)
+  * retrieval embeddings (within tolerance)
+  * training-step text + Z loss (within bf16-vs-fp32 drift)
+  * INT4 fake-quantization (exact at fp32 precision)
+
+Four bugs were surfaced and fixed by extending this harness:
+decode-once in `InferenceRunner.Generate`, layer-counting in
+`CliEntry.CountLayers`, the SentencePiece dummy-prefix mismatch
+around special tokens in `NeedleTokenizer`, and the attention mask
+using `-Infinity` instead of `finfo.min` (which produced NaN logits
+on any packed batch with padding — undetectable via single-example
+generation, but would have broken every training step).
 
 ## Intentionally NOT ported
 
@@ -56,9 +82,11 @@ of an inference / local-finetune .NET runtime:
 
 ## Known smaller gaps still open
 
-(All previously listed smaller gaps are now closed — see the ✦ rows in the
-table above.  Contrastive loss is now wired into `Trainer` via
+(All previously listed smaller gaps are now closed — see the ✦ and ✱ rows
+in the table above.  Contrastive loss is wired into `Trainer` via
 `TrainStepWithContrastive`; multi-example bin packing is implemented in
 `BatchBuilder.PackBatch`/`IteratePacked`; RoPE tables are cached
 per-device on `SimpleAttentionNetwork.GetRope` and grow lazily up to
-`TransformerConfig.MaxSeqLen`.)
+`TransformerConfig.MaxSeqLen`; throughput, bigram-repetition,
+generation-quality, WER, and retrieval Recall@k/MRR benchmarks live in
+`Inference/GenerationBenchmarks.cs`.)

@@ -189,9 +189,17 @@ public sealed class MultiHeadAttention : Module<Tensor, Tensor>
         Tensor attnWeights;
         if (mask is not null)
         {
-            using var negInf = torch.full(scores.shape, float.NegativeInfinity,
-                                          dtype: scores.dtype, device: scores.device);
-            using var masked = torch.where(mask, scores, negInf);
+            // Use the dtype's most negative *finite* value rather than -inf, so
+            // a fully-masked row (every position blocked, e.g. a padded query
+            // slot in a packed batch) does not produce a NaN softmax row that
+            // would then poison the encoder output via matmul.  Matches Python:
+            //   attn_weights = jnp.where(mask, scores, jnp.finfo(dtype).min)
+            float negFill = scores.dtype == ScalarType.Float64
+                ? (float)double.MinValue
+                : float.MinValue;
+            using var negFinite = torch.full(scores.shape, negFill,
+                                             dtype: scores.dtype, device: scores.device);
+            using var masked = torch.where(mask, scores, negFinite);
             attnWeights = torch.softmax(masked, dim: -1);
         }
         else
