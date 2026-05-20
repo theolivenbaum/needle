@@ -126,9 +126,22 @@ two real bugs in the .NET port plus one tokenizer edge case:
    underlying SP encoder into producing the right pieces.  Locked in by
    `TokenizerParityTests` (runs when `NEEDLE_TOKENIZER_PATH` is set).
 
-After all three fixes, the harness reports zero mismatches on the spec
-JSON (4/4 tokenize cases exact, both generations exact 19+14 tokens,
-retrieval embeddings within tolerance).
+4. **Attention mask used `float.NegativeInfinity` instead of `finfo.min`.**
+   A fully-masked query row (e.g. a padded slot in a packed batch)
+   then produced a NaN softmax row that poisoned the encoder output
+   via matmul.  Greedy single-example generation never hit this
+   because no padding was present, but every training step on packed
+   batches would have.  Fixed in `MultiHeadAttention.Call` to use the
+   dtype's most negative *finite* value, matching Python's
+   `jnp.finfo(dtype).min`.  Regression test
+   `Forward_PackedBatchWithPadding_NoNaNLogits`.
+
+After all four fixes, the harness reports zero mismatches on the spec
+JSON: tokenize 4/4 exact, tool-name normalization 4/4 exact, four
+generation cases (incl. constrained and tool-name normalized) all
+exact, batched generation exact, retrieval embeddings within
+tolerance, training-step loss within bf16 vs fp32 drift, INT4 fake-
+quantization exact to float32 precision.
 
 The five tokenizer parity tests no longer need
 `NEEDLE_TOKENIZER_PATH` — `NeedleTokenizerDownloader.EnsureTokenizerModel()`

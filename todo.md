@@ -33,18 +33,31 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 ✦ added on branch `claude/test-implement-missing-Xip11`.
 ✱ added on branch `claude/test-implement-missing-G5KET`.
 
-143 xUnit tests pass across all of the above (`dotnet test`); the
-five gated tokenizer-parity tests run when `NEEDLE_TOKENIZER_PATH`
-points at a real `needle.model` and are no-ops otherwise.
+146 xUnit tests pass across all of the above (`dotnet test`); the
+tokenizer-parity tests download `needle.model` from HuggingFace on
+first run via `NeedleTokenizerDownloader` and cache it locally — no
+env var needed.
 
 End-to-end parity against Python on the published checkpoint
 (`Cactus-Compute/needle`) is exercised by the harness in
 `scripts/compare/`.  The harness reports zero mismatches on the
-spec JSON (4/4 tokenizations exact, 19+14 generated tokens exact,
-retrieval embeddings within tolerance) after fixing three bugs
-surfaced by the run: decode-once in `InferenceRunner.Generate`,
-layer-counting in `CliEntry.CountLayers`, and the SentencePiece
-dummy-prefix mismatch around special tokens in `NeedleTokenizer`.
+spec JSON across:
+
+  * tokenize (4/4 exact)
+  * tool-name normalization (4/4 exact)
+  * generation (4 cases, incl. constrained and tool-name normalized)
+  * batched generation (2 items exact)
+  * retrieval embeddings (within tolerance)
+  * training-step text + Z loss (within bf16-vs-fp32 drift)
+  * INT4 fake-quantization (exact at fp32 precision)
+
+Four bugs were surfaced and fixed by extending this harness:
+decode-once in `InferenceRunner.Generate`, layer-counting in
+`CliEntry.CountLayers`, the SentencePiece dummy-prefix mismatch
+around special tokens in `NeedleTokenizer`, and the attention mask
+using `-Infinity` instead of `finfo.min` (which produced NaN logits
+on any packed batch with padding — undetectable via single-example
+generation, but would have broken every training step).
 
 ## Intentionally NOT ported
 

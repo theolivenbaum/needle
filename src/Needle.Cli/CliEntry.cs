@@ -316,11 +316,36 @@ public static class CliEntry
             output["tokenize"] = outArr;
         }
 
-        // Generation and retrieval both need the model; skip loading if neither
-        // section is present (tokenizer-only diffs don't need weights).
+        // ── Tool-name normalization (pure-function check, no model) ─────────
+        if (specRoot["tool_normalize"] is JsonArray normSpec)
+        {
+            var outArr = new JsonArray();
+            foreach (var item in normSpec)
+            {
+                string input = item?.GetValue<string>() ?? "";
+                var (normalized, nameMap) = ToolNormalizer.NormalizeTools(input);
+                var mapObj = new JsonObject();
+                foreach (var (snake, orig) in nameMap)
+                    mapObj[snake] = orig;
+                outArr.Add(new JsonObject
+                {
+                    ["input"]    = input,
+                    ["tools"]    = normalized,
+                    ["name_map"] = mapObj,
+                });
+            }
+            output["tool_normalize"] = outArr;
+        }
+
+        // Generation, retrieval, forward-loss, and quantize all need the
+        // model; skip loading if none are requested (tokenizer-only diffs
+        // don't need weights).
         bool needsModel =
-            specRoot["generate"]         is JsonArray ||
-            specRoot["encode_retrieval"] is JsonObject;
+            specRoot["generate"]         is JsonArray  ||
+            specRoot["generate_batch"]   is JsonArray  ||
+            specRoot["encode_retrieval"] is JsonObject ||
+            specRoot["forward_loss"]     is JsonObject ||
+            specRoot["quantize"]         is JsonObject;
 
         if (needsModel)
         {
@@ -379,6 +404,49 @@ public static class CliEntry
                     output["generate"] = outArr;
                 }
 
+                // ── Batched generation ───────────────────────────────────────
+                if (specRoot["generate_batch"] is JsonArray gbSpec)
+                {
+                    var outArr = new JsonArray();
+                    foreach (var entry in gbSpec)
+                    {
+                        if (entry is not JsonObject obj)
+                            throw new InvalidOperationException("generate_batch items must be objects.");
+                        string id      = obj["id"]?.GetValue<string>() ?? "";
+                        var items      = (obj["items"] as JsonArray)
+                                          ?? throw new InvalidOperationException("generate_batch.items missing");
+                        int maxGen     = obj["max_gen_len"]?.GetValue<int>() ?? 128;
+                        int maxEnc     = obj["max_enc_len"]?.GetValue<int>() ?? 1024;
+                        bool constrained = obj["constrained"]?.GetValue<bool>() ?? false;
+                        bool normalize   = obj["normalize"]?.GetValue<bool>() ?? false;
+
+                        var queries = items.Select(it => it?["query"]?.GetValue<string>() ?? "").ToList();
+                        var tools   = items.Select(it => it?["tools"]?.GetValue<string>() ?? "[]").ToList();
+
+                        var preds = runner.GenerateBatch(
+                            queries, tools,
+                            maxGenLen: maxGen,
+                            maxEncLen: maxEnc,
+                            normalize: normalize,
+                            constrained: constrained);
+
+                        var results = new JsonArray();
+                        for (int k = 0; k < queries.Count; k++)
+                        {
+                            var ids = tokenizer.Encode(preds[k]);
+                            results.Add(new JsonObject
+                            {
+                                ["query"] = queries[k],
+                                ["tools"] = tools[k],
+                                ["text"]  = preds[k],
+                                ["ids"]   = new JsonArray([.. ids.Select(i => JsonValue.Create(i))]),
+                            });
+                        }
+                        outArr.Add(new JsonObject { ["id"] = id, ["results"] = results });
+                    }
+                    output["generate_batch"] = outArr;
+                }
+
                 // ── Retrieval-embedding tests ────────────────────────────────
                 if (specRoot["encode_retrieval"] is JsonObject retSpec)
                 {
@@ -397,7 +465,7 @@ public static class CliEntry
                     {
                         var row = new JsonArray();
                         for (int j = 0; j < D; j++)
-                            row.Add(JsonValue.Create(System.Math.Round(embs[i, j], floatPrec)));
+                            row.Add(JsonValue.Create(SafeRound(embs[i, j], floatPrec)));
                         embArr.Add(row);
                     }
 
@@ -407,6 +475,19 @@ public static class CliEntry
                         ["texts"]      = new JsonArray([.. textList.Select(t => JsonValue.Create(t))]),
                         ["embeddings"] = embArr,
                     };
+                }
+
+                // ── Forward + loss (training-math parity) ────────────────────
+                if (specRoot["forward_loss"] is JsonObject flSpec)
+                {
+                    var (lossOut, _) = DumpForwardLoss(model, flSpec, floatPrec);
+                    output["forward_loss"] = lossOut;
+                }
+
+                // ── Quantization parity ──────────────────────────────────────
+                if (specRoot["quantize"] is JsonObject qSpec)
+                {
+                    output["quantize"] = DumpQuantize(model, qSpec, floatPrec);
                 }
             }
             finally
@@ -434,6 +515,173 @@ public static class CliEntry
         File.WriteAllText(outPath, output.ToJsonString(serializerOpts));
         Console.WriteLine($"wrote {outPath}");
         return 0;
+    }
+
+    /// <summary>
+    /// Round a float for JSON output, replacing non-finite values with 0 so
+    /// JsonValue.Create doesn't throw on Inf/NaN.  Drift from the Python side
+    /// will surface as a tolerance failure in the comparator.
+    /// </summary>
+    private static double SafeRound(double v, int digits)
+    {
+        if (double.IsNaN(v) || double.IsInfinity(v)) return 0.0;
+        return System.Math.Round(v, digits);
+    }
+
+    // ── Forward-loss dump (training-math parity) ──────────────────────────────
+
+    private static (JsonObject Result, Tensor Logits) DumpForwardLoss(
+        SimpleAttentionNetwork model,
+        JsonObject spec,
+        int floatPrec)
+    {
+        model.eval();
+        using var noGrad = torch.no_grad();
+
+        long[,] LoadInts(string key)
+        {
+            var rows = spec[key] as JsonArray
+                ?? throw new InvalidOperationException($"forward_loss.{key} missing");
+            int B = rows.Count;
+            int T = (rows[0] as JsonArray)?.Count ?? 0;
+            var arr = new long[B, T];
+            for (int b = 0; b < B; b++)
+            {
+                var r = rows[b] as JsonArray
+                    ?? throw new InvalidOperationException($"forward_loss.{key}[{b}] not array");
+                for (int t = 0; t < T; t++) arr[b, t] = r[t]?.GetValue<long>() ?? 0L;
+            }
+            return arr;
+        }
+
+        long[,] src    = LoadInts("src_tokens");
+        long[,] tgtIn  = LoadInts("tgt_in_tokens");
+        long[,] tgtOut = LoadInts("tgt_out_tokens");
+        long[,] lossM  = LoadInts("loss_mask");
+        long[,] encSeg = LoadInts("enc_seg_ids");
+        long[,] decSeg = LoadInts("dec_seg_ids");
+
+        long B = src.GetLength(0);
+        long Te = src.GetLength(1);
+        long Td = tgtIn.GetLength(1);
+
+        using var srcT    = torch.tensor(src.Cast<long>().ToArray(),    new long[] { B, Te });
+        using var tgtInT  = torch.tensor(tgtIn.Cast<long>().ToArray(),  new long[] { B, Td });
+        using var tgtOutT = torch.tensor(tgtOut.Cast<long>().ToArray(), new long[] { B, Td });
+
+        // The training mask helpers expect int32 segment IDs.
+        using var encSegT = torch.tensor(encSeg.Cast<long>().Select(x => (int)x).ToArray(),
+                                         new long[] { B, Te }, dtype: ScalarType.Int32);
+        using var decSegT = torch.tensor(decSeg.Cast<long>().Select(x => (int)x).ToArray(),
+                                         new long[] { B, Td }, dtype: ScalarType.Int32);
+        using var lossMT  = torch.tensor(lossM.Cast<long>().Select(x => (int)x).ToArray(),
+                                         new long[] { B, Td }, dtype: ScalarType.Int32);
+
+        using var srcMask   = MaskUtils.MakePackingMask(encSegT);
+        using var tgtMask   = MaskUtils.MakeCausalPackingMask(decSegT);
+        using var crossMask = MaskUtils.MakeCrossPackingMask(encSegT, decSegT);
+
+        var logits = model.Forward(srcT, tgtInT, srcMask, tgtMask, crossMask);
+
+        // Token-class weights match the trainer defaults (base, name, value, key).
+        var weightMap = LossFunctions.DefaultTokenWeightMap;
+        using var tokenWeights = LossFunctions.BuildTokenWeights(lossMT, weightMap);
+        using var textLoss     = LossFunctions.TextLoss(logits, tgtOutT, tokenWeights, decSegT);
+        using var zLoss        = LossFunctions.ZLoss(logits);
+        using var totalLoss    = textLoss + zLoss;
+
+        float ce = textLoss.item<float>();
+        float zl = zLoss.item<float>();
+
+        // Probe: first 8 vocab logits at every (batch, position).  Lets the
+        // comparator diff numerically rather than just a single scalar.
+        long V = logits.shape[2];
+        long probeWidth = System.Math.Min(8L, V);
+        using var probeT = logits.index(TensorIndex.Ellipsis,
+                                       TensorIndex.Slice(stop: probeWidth));
+        var flat = probeT.to(ScalarType.Float32).contiguous().data<float>().ToArray();
+        var probe = new JsonArray();
+        for (long b = 0; b < B; b++)
+        {
+            for (long t = 0; t < Td; t++)
+            {
+                var row = new JsonArray();
+                long baseIdx = (b * Td + t) * probeWidth;
+                for (long k = 0; k < probeWidth; k++)
+                    row.Add(JsonValue.Create(SafeRound(flat[baseIdx + k], floatPrec)));
+                probe.Add(row);
+            }
+        }
+
+        var result = new JsonObject
+        {
+            ["shape"]        = new JsonArray(B, Td, V),
+            ["ce_loss"]      = JsonValue.Create(SafeRound((double)ce,      floatPrec)),
+            ["z_loss"]       = JsonValue.Create(SafeRound((double)zl,      floatPrec)),
+            ["total_loss"]   = JsonValue.Create(SafeRound((double)(ce + zl), floatPrec)),
+            ["logits_probe"] = probe,
+        };
+        return (result, logits);
+    }
+
+    // ── Quantization dump ─────────────────────────────────────────────────────
+
+    private static JsonObject DumpQuantize(
+        SimpleAttentionNetwork model,
+        JsonObject spec,
+        int floatPrec)
+    {
+        string key   = spec["tensor_key"]?.GetValue<string>()
+                       ?? throw new InvalidOperationException("quantize.tensor_key missing");
+        var rows = spec["rows"] as JsonArray;
+        var cols = spec["cols"] as JsonArray;
+        int r0 = rows?[0]?.GetValue<int>() ?? 0;
+        int r1 = rows?[1]?.GetValue<int>() ?? 32;
+        int c0 = cols?[0]?.GetValue<int>() ?? 0;
+        int c1 = cols?[1]?.GetValue<int>() ?? 32;
+        int gs = spec["group_size"]?.GetValue<int>() ?? 32;
+        string prec = spec["precision"]?.GetValue<string>() ?? "int4";
+
+        using var noGrad = torch.no_grad();
+
+        // Find the parameter by name.
+        Tensor? tensor = null;
+        foreach (var (name, p) in model.named_parameters())
+        {
+            if (name == key) { tensor = p; break; }
+        }
+        if (tensor is null)
+            throw new InvalidOperationException($"quantize: parameter '{key}' not in model.");
+
+        using var sub = tensor[TensorIndex.Slice(r0, r1), TensorIndex.Slice(c0, c1)]
+                        .to(ScalarType.Float32)
+                        .contiguous();
+
+        using var quant = prec == "int8"
+            ? Quantize.FakeQuantizeInt8(sub, gs)
+            : Quantize.FakeQuantizeInt4(sub, gs);
+
+        int H = (int)quant.shape[0], W = (int)quant.shape[1];
+        var flat = quant.to(ScalarType.Float32).contiguous().data<float>().ToArray();
+        var values = new JsonArray();
+        for (int i = 0; i < H; i++)
+        {
+            var row = new JsonArray();
+            for (int j = 0; j < W; j++)
+                row.Add(JsonValue.Create(SafeRound(flat[i * W + j], floatPrec)));
+            values.Add(row);
+        }
+
+        return new JsonObject
+        {
+            ["tensor_key"] = key,
+            ["rows"]       = new JsonArray(r0, r1),
+            ["cols"]       = new JsonArray(c0, c1),
+            ["group_size"] = gs,
+            ["precision"]  = prec,
+            ["shape"]      = new JsonArray(H, W),
+            ["values"]     = values,
+        };
     }
 
     // ── Loading helpers ──────────────────────────────────────────────────────

@@ -96,6 +96,63 @@ public sealed class NeedleModelTests
     }
 
     [Fact]
+    public void Forward_PackedBatchWithPadding_NoNaNLogits()
+    {
+        // Regression for an attention bug: the mask used float.NegativeInfinity
+        // to block disallowed positions, so a fully-masked query row (e.g. a
+        // padded slot in a packed batch) produced softmax = NaN, which then
+        // poisoned the encoder output via matmul.  Python uses finfo.min — a
+        // large but finite negative — and the .NET side has to match.
+        var cfg   = SmallConfig();
+        var model = new SimpleAttentionNetwork(cfg);
+        model.eval();
+        using var noGrad = torch.no_grad();
+
+        const int B  = 2;
+        const int Te = 6;
+        const int Td = 4;
+
+        // Both rows have padding at the tail of the encoder input.
+        var srcArr = new long[,]
+        {
+            { 11, 12, 13, 14,  0,  0 },   // 2 pad tokens
+            { 21, 22, 23,  0,  0,  0 },   // 3 pad tokens
+        };
+        var encSegArr = new int[,]
+        {
+            { 1, 1, 1, 1, 0, 0 },
+            { 1, 1, 1, 0, 0, 0 },
+        };
+        var tgtArr = new long[,]
+        {
+            { 1, 5, 6, 7 },
+            { 1, 8, 9, 0 },
+        };
+        var decSegArr = new int[,]
+        {
+            { 1, 1, 1, 1 },
+            { 1, 1, 1, 0 },
+        };
+
+        using var src    = torch.tensor(srcArr.Cast<long>().ToArray(), new long[] { B, Te });
+        using var tgt    = torch.tensor(tgtArr.Cast<long>().ToArray(), new long[] { B, Td });
+        using var encSeg = torch.tensor(encSegArr.Cast<int>().ToArray(),
+                                         new long[] { B, Te }, dtype: ScalarType.Int32);
+        using var decSeg = torch.tensor(decSegArr.Cast<int>().ToArray(),
+                                         new long[] { B, Td }, dtype: ScalarType.Int32);
+
+        using var srcMask   = MaskUtils.MakePackingMask(encSeg);
+        using var tgtMask   = MaskUtils.MakeCausalPackingMask(decSeg);
+        using var crossMask = MaskUtils.MakeCrossPackingMask(encSeg, decSeg);
+
+        using var logits = model.Forward(src, tgt, srcMask, tgtMask, crossMask);
+
+        Assert.Equal(new long[] { B, Td, cfg.VocabSize }, logits.shape);
+        Assert.False(logits.isnan().any().item<bool>(), "Logits contain NaN — attention mask is using -inf instead of finfo.min.");
+        Assert.False(logits.isinf().any().item<bool>(), "Logits contain Inf — attention mask is using -inf instead of finfo.min.");
+    }
+
+    [Fact]
     public void Forward_FullPass_ProducesLogits()
     {
         var cfg   = SmallConfig();
