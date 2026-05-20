@@ -19,6 +19,9 @@ public sealed class InferenceRunner : IDisposable
     private readonly NeedleTokenizer _tokenizer;
     private readonly TransformerConfig _config;
 
+    /// <summary>The tokenizer this runner was constructed with.</summary>
+    public NeedleTokenizer Tokenizer => _tokenizer;
+
     public InferenceRunner(
         SimpleAttentionNetwork model,
         NeedleTokenizer tokenizer,

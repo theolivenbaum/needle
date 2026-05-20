@@ -21,6 +21,7 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 | `model/export.py`                   | `Weights/SubmodelExport.cs` ✨                              |
 | `training/eval.py` (tool-call F1)   | `Inference/ToolCallMetrics.cs` ✨                           |
 | `training/eval.py` (perplexity)     | `Training/PerplexityEval.cs` ✨                             |
+| `training/eval.py` (throughput, repetition, generation-quality, WER, retrieval Recall@k / MRR) | `Inference/GenerationBenchmarks.cs` ✱ |
 | `training/finetune.py` (JSONL flow) | `Training/JsonlDataset.cs`, `Training/JsonlFinetuner.cs` ✨ |
 | `cli.py` (run/eval/finetune/export) | `src/Needle.Cli/CliEntry.cs` ✨                             |
 | n/a (own binary format)             | `Weights/WeightLoader.cs` (.ndlw + safetensors)            |
@@ -30,8 +31,9 @@ Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
 
 ✨ added on branch `claude/investigate-port-gaps-Z1hjA`.
 ✦ added on branch `claude/test-implement-missing-Xip11`.
+✱ added on branch `claude/test-implement-missing-G5KET`.
 
-124 xUnit tests pass across all of the above (`dotnet test`).
+137 xUnit tests pass across all of the above (`dotnet test`).
 
 ## Intentionally NOT ported
 
@@ -56,9 +58,11 @@ of an inference / local-finetune .NET runtime:
 
 ## Known smaller gaps still open
 
-(All previously listed smaller gaps are now closed — see the ✦ rows in the
-table above.  Contrastive loss is now wired into `Trainer` via
+(All previously listed smaller gaps are now closed — see the ✦ and ✱ rows
+in the table above.  Contrastive loss is wired into `Trainer` via
 `TrainStepWithContrastive`; multi-example bin packing is implemented in
 `BatchBuilder.PackBatch`/`IteratePacked`; RoPE tables are cached
 per-device on `SimpleAttentionNetwork.GetRope` and grow lazily up to
-`TransformerConfig.MaxSeqLen`.)
+`TransformerConfig.MaxSeqLen`; throughput, bigram-repetition,
+generation-quality, WER, and retrieval Recall@k/MRR benchmarks live in
+`Inference/GenerationBenchmarks.cs`.)
