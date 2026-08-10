@@ -54,8 +54,20 @@ public sealed class NeedleAgent
     private readonly CactTokenizer _tokenizer;
     private readonly string _toolsJson;
     private readonly string? _system;
+    private readonly string[]? _tokenStrings;
+    private readonly TokenIndex? _tokenIndex;
     private NeedleSession _session;
     private bool _started;
+
+    /// <summary>
+    /// Whether the emitted call is constrained to the declared schemas.
+    ///
+    /// With this on, tool names and argument keys can only ever be ones the
+    /// schemas declare — an unsupported argument becomes impossible rather than
+    /// merely unlikely.  The derivation stays unconstrained, so it remains
+    /// legible free text.
+    /// </summary>
+    public bool Constrained { get; }
 
     /// <summary>The tokenizer this agent renders with.</summary>
     public CactTokenizer Tokenizer => _tokenizer;
@@ -67,13 +79,28 @@ public sealed class NeedleAgent
     /// <param name="tokenizer">Matching tokenizer, normally from the same blob.</param>
     /// <param name="toolsJson">Declared schemas as a JSON array string.</param>
     /// <param name="system">Optional system facts (never instructions).</param>
-    public NeedleAgent(Needle2Model model, CactTokenizer tokenizer, string toolsJson, string? system = null)
+    /// <param name="constrained">
+    /// Compile the schemas into a decode-time grammar. On by default; turn it off
+    /// to see what the model would emit unconstrained.
+    /// </param>
+    public NeedleAgent(Needle2Model model, CactTokenizer tokenizer, string toolsJson,
+                       string? system = null, bool constrained = true)
     {
         _model = model;
         _tokenizer = tokenizer;
         _toolsJson = toolsJson;
         _system = system;
         _session = new NeedleSession(model);
+        Constrained = constrained;
+
+        if (constrained)
+        {
+            // The token→surface table and its first-character index depend only
+            // on the vocabulary, so build them once per agent rather than once
+            // per turn.
+            _tokenStrings = ConstrainedDecodingFactory.BuildTokenStrings(tokenizer);
+            _tokenIndex = new TokenIndex(_tokenStrings);
+        }
     }
 
     /// <summary>Rewind the conversation, keeping the tools loaded.</summary>
@@ -105,6 +132,10 @@ public sealed class NeedleAgent
             _started = true;
         }
 
+        var grammar = _tokenStrings is not null && _tokenIndex is not null
+            ? new ConstrainedDecoder([new ToolConstraints(_toolsJson)], _tokenStrings, _tokenIndex)
+            : null;
+
         var generated = new List<int>(maxNewTokens);
         double logProbSum = 0;
         int scored = 0;
@@ -112,9 +143,23 @@ public sealed class NeedleAgent
         var logits = _session.Advance(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(promptIds));
         for (int i = 0; i < maxNewTokens; i++)
         {
-            int next = Ops.ArgMax(logits.ReadSpan);
-            logProbSum += TokenLogProbability(logits.ReadSpan, next);
+            var scores = logits.ReadSpan;
+            int next;
+            if (grammar is not null && grammar.IsActive(0))
+            {
+                var masked = grammar.ConstrainLogits(scores.ToArray(), 0);
+                next = Ops.ArgMax(masked);
+            }
+            else
+            {
+                next = Ops.ArgMax(scores);
+            }
+
+            // Score against the unconstrained distribution: confidence should
+            // reflect what the model believed, not what the grammar allowed.
+            logProbSum += TokenLogProbability(scores, next);
             scored++;
+            grammar?.Update(0, next);
 
             if (next == _tokenizer.EosId || next == ChatMarkers.ImEndId) break;
             generated.Add(next);
