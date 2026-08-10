@@ -36,15 +36,96 @@ public static class Ops
         if (c.Length < (long)m * n) throw new ArgumentException("Destination is too small.", nameof(c));
 
         c[..(m * n)].Clear();
-        for (int i = 0; i < m; i++)
+        MatMulRows(a, b, c, 0, m, k, n);
+    }
+
+    /// <summary>
+    /// Parallel row-major GEMM.  Splits the output rows across the thread pool
+    /// when the operands are large enough to pay for it; otherwise identical to
+    /// <see cref="MatMul(ReadOnlySpan{float}, ReadOnlySpan{float}, Span{float}, int, int, int)"/>.
+    /// </summary>
+    public static void MatMulParallel(NdArray a, NdArray b, NdArray c, int m, int k, int n)
+    {
+        c.Span[..(m * n)].Clear();
+
+        // Below a few hundred thousand multiply-adds the scheduling overhead
+        // dominates and a straight loop wins.
+        const long ParallelThreshold = 1 << 18;
+        int cores = Environment.ProcessorCount;
+        if (cores <= 1 || (long)m * k * n < ParallelThreshold)
+        {
+            MatMulRows(a.ReadSpan, b.ReadSpan, c.Span, 0, m, k, n);
+            return;
+        }
+
+        // Spans cannot cross the lambda boundary; the arrays outlive the call.
+        float[] aBuffer = a.Buffer, bBuffer = b.Buffer, cBuffer = c.Buffer;
+        int aOffset = a.Offset, bOffset = b.Offset, cOffset = c.Offset;
+
+        // Only the prefill has enough output rows to be worth splitting.  A
+        // single-token decode step is bound by streaming the weights, not by
+        // arithmetic, so spreading one output row over several cores only adds
+        // contention — measured slower on a 4-core box than staying serial.
+        if (m < 8)
+        {
+            MatMulRows(a.ReadSpan, b.ReadSpan, c.Span, 0, m, k, n);
+            return;
+        }
+
+        int workers = System.Math.Min(cores, m / 4);
+        int chunk = (m + workers - 1) / workers;
+        Parallel.For(0, workers, w =>
+        {
+            int start = w * chunk;
+            int count = System.Math.Min(chunk, m - start);
+            if (count <= 0) return;
+            MatMulRows(aBuffer.AsSpan(aOffset + start * k, count * k),
+                       bBuffer.AsSpan(bOffset, k * n),
+                       cBuffer.AsSpan(cOffset + start * n, count * n),
+                       0, count, k, n);
+        });
+    }
+
+    /// <summary>
+    /// Accumulate <c>rows</c> output rows starting at <paramref name="first"/>.
+    /// Four rows of <c>a</c> are processed together so each row of <c>b</c> is
+    /// read once and reused four times, which is what turns this from
+    /// memory-bound into compute-bound.
+    /// </summary>
+    private static void MatMulRows(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+                                   int first, int rows, int k, int n)
+    {
+        int i = first;
+        for (; i + 4 <= first + rows; i += 4)
+        {
+            var c0 = c.Slice(i * n, n);
+            var c1 = c.Slice((i + 1) * n, n);
+            var c2 = c.Slice((i + 2) * n, n);
+            var c3 = c.Slice((i + 3) * n, n);
+            var a0 = a.Slice(i * k, k);
+            var a1 = a.Slice((i + 1) * k, k);
+            var a2 = a.Slice((i + 2) * k, k);
+            var a3 = a.Slice((i + 3) * k, k);
+
+            for (int p = 0; p < k; p++)
+            {
+                var bRow = b.Slice(p * n, n);
+                float s0 = a0[p], s1 = a1[p], s2 = a2[p], s3 = a3[p];
+                if (s0 != 0f) TensorPrimitives.MultiplyAdd(bRow, s0, c0, c0);
+                if (s1 != 0f) TensorPrimitives.MultiplyAdd(bRow, s1, c1, c1);
+                if (s2 != 0f) TensorPrimitives.MultiplyAdd(bRow, s2, c2, c2);
+                if (s3 != 0f) TensorPrimitives.MultiplyAdd(bRow, s3, c3, c3);
+            }
+        }
+
+        for (; i < first + rows; i++)
         {
             var row = c.Slice(i * n, n);
             var aRow = a.Slice(i * k, k);
             for (int p = 0; p < k; p++)
             {
                 float scale = aRow[p];
-                if (scale == 0f) continue;
-                TensorPrimitives.MultiplyAdd(b.Slice(p * n, n), scale, row, row);
+                if (scale != 0f) TensorPrimitives.MultiplyAdd(b.Slice(p * n, n), scale, row, row);
             }
         }
     }
@@ -65,7 +146,7 @@ public static class Ops
         var shape = (int[])a.Shape.Clone();
         shape[^1] = n;
         var c = new NdArray(shape);
-        MatMul(a.ReadSpan, b.ReadSpan, c.Span, m, k, n);
+        MatMulParallel(a, b, c, m, k, n);
         return c;
     }
 

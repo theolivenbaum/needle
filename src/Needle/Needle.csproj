@@ -14,10 +14,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- SentencePiece tokenizer -->
-    <PackageReference Include="Microsoft.ML.Tokenizers" Version="0.22.0" />
-    <!-- SIMD tensor primitives — the only numeric dependency; the model itself
-         is plain float[] + Vector<float> + TensorPrimitives. -->
+    <!-- The only dependency. Everything else — the model, the .cact reader and
+         the SentencePiece tokenizer — is plain float[] / Span<float> over
+         Vector<float> and TensorPrimitives. -->
     <PackageReference Include="System.Numerics.Tensors" Version="9.0.0" />
   </ItemGroup>
 

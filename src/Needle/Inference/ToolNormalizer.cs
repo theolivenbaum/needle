@@ -64,7 +64,7 @@ public static class ToolNormalizer
             }
 
             string original = nameProp.GetString() ?? string.Empty;
-            string snake    = NeedleTokenizer.ToSnakeCase(original);
+            string snake    = ToSnakeCase(original);
             nameMap[snake]  = original;
 
             // Rebuild the tool object with the snake_case name.
@@ -199,5 +199,37 @@ public static class ToolNormalizer
             text = text.Replace(snake, original, StringComparison.Ordinal);
         }
         return text;
+    }
+
+    /// <summary>
+    /// Convert a tool name to snake_case: camel and Pascal boundaries become
+    /// underscores, runs of non-alphanumerics collapse to a single underscore.
+    /// </summary>
+    public static string ToSnakeCase(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return name;
+
+        var builder = new System.Text.StringBuilder(name.Length + 8);
+        for (int i = 0; i < name.Length; i++)
+        {
+            char c = name[i];
+            if (char.IsUpper(c))
+            {
+                bool boundary = i > 0
+                    && (char.IsLower(name[i - 1])
+                        || (i + 1 < name.Length && char.IsLower(name[i + 1])));
+                if (boundary && builder.Length > 0 && builder[^1] != '_') builder.Append('_');
+                builder.Append(char.ToLowerInvariant(c));
+            }
+            else if (char.IsLetterOrDigit(c))
+            {
+                builder.Append(c);
+            }
+            else if (builder.Length > 0 && builder[^1] != '_')
+            {
+                builder.Append('_');
+            }
+        }
+        return builder.ToString().Trim('_');
     }
 }

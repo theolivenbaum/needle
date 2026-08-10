@@ -1,8 +1,11 @@
 using System.Diagnostics;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Needle.Diagnostics;
 using Needle.Inference;
 using Needle.Math;
 using Needle.Model;
+using Needle.Tokenizer;
 using Needle.Weights;
 
 namespace Needle.Cli;
@@ -16,19 +19,24 @@ public static class CliEntry
         needle — Needle 2 Simple Attention Network, pure .NET
 
         Usage:
-          needle parity  --fixtures <dir> [--tolerance 0.01] [--verbose]
-          needle info    --weights <dir|file> [--config <path>]
-          needle run     --weights <dir|file> [--config <path>] --tokens 2,100,200 [--max-new 32]
+          needle parity     --fixtures <dir> [--tolerance 0.01] [--verbose]
+          needle cact-check --cact <file> --expected <dir> [--tolerance 1e-4] [--verbose]
+          needle info       --weights <dir|file|.cact> [--config <path>]
+          needle run        --weights <dir|file|.cact> [--config <path>] --tokens 2,100 [--max-new 32]
+          needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
 
         Commands:
-          parity  Compare this implementation against the JAX reference, stage by
-                  stage, using fixtures written by
-                  scripts/parity/dump_reference.py.
-          info    Print the geometry, parameter count and KV budget of a checkpoint.
-          run     Greedy-decode from raw token IDs with the KV-cached session.
+          parity      Compare this implementation against the JAX reference, stage
+                      by stage, using fixtures from
+                      scripts/parity/dump_reference.py.
+          cact-check  Compare this reader's dequantisation of a .cact deployment
+                      blob against the reference's own read_export, using the dump
+                      from scripts/parity/dump_cact.py.
+          info        Print the geometry, parameter count and KV budget.
+          run         Greedy-decode from raw token IDs with the KV-cached session.
 
-        Weights may be a directory holding weights.safetensors + config.json, or a
-        .safetensors file (pass --config alongside it).
+        Weights may be a .cact blob, a directory holding weights.safetensors +
+        config.json, or a .safetensors file (pass --config alongside it).
         """;
 
     public static int Run(string[] args)
@@ -45,8 +53,10 @@ public static class CliEntry
             return args[0] switch
             {
                 "parity" => RunParity(rest),
+                "cact-check" => RunCactCheck(rest),
                 "info" => RunInfo(rest),
                 "run" => RunGenerate(rest),
+                "call" => RunCall(rest),
                 _ => Unknown(args[0]),
             };
         }
@@ -112,6 +122,70 @@ public static class CliEntry
         return allPassed ? 0 : 1;
     }
 
+    // ── cact-check ───────────────────────────────────────────────────────────
+
+    private static int RunCactCheck(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        string cact = options.GetRequired("cact");
+        string expected = options.GetRequired("expected");
+        float tolerance = float.Parse(options.Get("tolerance", "1e-4"));
+        bool verbose = options.GetFlag("verbose");
+
+        var checks = CactCheck.Run(cact, expected);
+        var byWidth = new SortedDictionary<int, (int Count, float Worst)>();
+
+        foreach (var check in checks)
+        {
+            if (verbose)
+                Console.WriteLine($"  t{check.Index:D4} {check.Dtype,-9} bits={check.Bits,-2} "
+                                  + $"{string.Join("x", check.Shape),-16} {check.Delta}");
+
+            int width = check.Dtype == CactDtype.Quantized ? check.Bits : 0;
+            var entry = byWidth.GetValueOrDefault(width);
+            byWidth[width] = (entry.Count + 1, System.Math.Max(entry.Worst, check.Delta.MaxRelative));
+        }
+
+        Console.WriteLine($"compared {checks.Count} tensors from {Path.GetFileName(cact)}");
+        foreach (var (width, entry) in byWidth)
+        {
+            string label = width == 0 ? "fp16" : width == 5 ? "ternary" : $"CQ{width}";
+            Console.WriteLine($"  {label,-8} {entry.Count,4} tensors, worst relative error {entry.Worst:G4}");
+        }
+
+        float worst = checks.Count == 0 ? 0f : checks.Max(c => c.Delta.MaxRelative);
+        bool passed = worst <= tolerance;
+        Console.WriteLine(passed
+            ? $"all tensors within {tolerance:G3} relative error"
+            : $"worst relative error {worst:G4} exceeds {tolerance:G3}");
+
+        string tokenizerJson = Path.Combine(expected, "tokenizer.json");
+        if (File.Exists(tokenizerJson))
+        {
+            var tokenizer = CactTokenizer.FromCact(cact);
+            ChatMarkers.Validate(tokenizer);
+            var report = TokenizerCheck.Run(tokenizer, tokenizerJson);
+
+            Console.WriteLine($"tokenizer: {tokenizer.VocabSize} pieces, "
+                              + $"{report.Cases.Count(c => c.EncodeMatches && c.DecodeMatches)}"
+                              + $"/{report.Cases.Count} cases round-trip identically");
+            foreach (string mismatch in report.PieceMismatches)
+                Console.WriteLine("  piece mismatch: " + mismatch);
+            foreach (var result in report.Cases.Where(c => !c.EncodeMatches || !c.DecodeMatches))
+            {
+                Console.WriteLine($"  mismatch at token {result.FirstDivergence} for "
+                                  + $"{JsonSerializer.Serialize(result.Text)}");
+                Console.WriteLine($"    reference: [{string.Join(",", result.Expected)}] -> "
+                                  + JsonSerializer.Serialize(result.ExpectedDecoded));
+                Console.WriteLine($"    port:      [{string.Join(",", result.Actual)}] -> "
+                                  + JsonSerializer.Serialize(result.ActualDecoded));
+            }
+            passed &= report.Passed;
+        }
+
+        return passed ? 0 : 1;
+    }
+
     // ── info ─────────────────────────────────────────────────────────────────
 
     private static int RunInfo(string[] args)
@@ -166,6 +240,54 @@ public static class CliEntry
         return 0;
     }
 
+    // ── call ─────────────────────────────────────────────────────────────────
+
+    private static int RunCall(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        string weightsPath = options.GetRequired("weights");
+        var model = LoadModel(options);
+        var tokenizer = CactTokenizer.FromCact(weightsPath);
+
+        string tools = ReadInline(options.Get("tools", "[]"));
+        string query = options.GetRequired("query");
+        string? system = options.GetOrNull("system");
+        int maxNew = int.Parse(options.Get("max-new", "256"));
+
+        var agent = new NeedleAgent(model, tokenizer, tools, system);
+        var stopwatch = Stopwatch.StartNew();
+        var response = agent.Complete(query, maxNew);
+        stopwatch.Stop();
+
+        var payload = new JsonObject
+        {
+            ["type"] = response.Type,
+            ["success"] = response.Success,
+            ["error"] = response.Error,
+            ["function_calls"] = new JsonArray(response.FunctionCalls
+                .Select(c => (JsonNode)new JsonObject
+                {
+                    ["name"] = c.Name,
+                    ["arguments"] = c.Arguments.DeepClone(),
+                }).ToArray()),
+            ["reasoning"] = response.Reasoning,
+            ["confidence"] = System.Math.Round(response.Confidence, 4),
+            ["prompt_tokens"] = response.PromptTokens,
+            ["generated_tokens"] = response.GeneratedTokens,
+        };
+
+        Console.WriteLine(payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        Console.Error.WriteLine(
+            $"{response.PromptTokens} prompt + {response.GeneratedTokens} generated tokens "
+            + $"in {stopwatch.ElapsedMilliseconds} ms");
+        if (options.GetFlag("raw")) Console.Error.WriteLine("raw: " + response.Text);
+        return 0;
+    }
+
+    /// <summary>Reads a value that may be given inline or as <c>@path</c>.</summary>
+    private static string ReadInline(string value) =>
+        value.StartsWith('@') ? File.ReadAllText(value[1..]) : value;
+
     // ── shared ───────────────────────────────────────────────────────────────
 
     private static Needle2Model LoadModel(ArgParser options)
@@ -173,6 +295,15 @@ public static class CliEntry
         string weights = options.GetRequired("weights");
 
         if (Directory.Exists(weights)) return ParityHarness.LoadModel(weights);
+
+        if (weights.EndsWith(".cact", StringComparison.OrdinalIgnoreCase))
+        {
+            var template = options.GetOrNull("config") is { } configFile
+                ? CheckpointConfig.Load(configFile)
+                : new TransformerConfig();
+            var loaded = CactLayout.Load(weights, template);
+            return new Needle2Model(Needle2Weights.FromFlat(loaded.Config, loaded.Parameters));
+        }
 
         string configPath = options.GetOrNull("config")
             ?? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(weights)) ?? ".", "config.json");
