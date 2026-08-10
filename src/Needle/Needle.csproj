@@ -16,9 +16,8 @@
   <ItemGroup>
     <!-- SentencePiece tokenizer -->
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="0.22.0" />
-    <!-- Neural network ops (CPU build; swap for TorchSharp-cuda-* for GPU) -->
-    <PackageReference Include="TorchSharp-cpu" Version="0.103.0" />
-    <!-- SIMD-accelerated tensor primitives (Softmax, Exp, Sum, etc.) -->
+    <!-- SIMD tensor primitives — the only numeric dependency; the model itself
+         is plain float[] + Vector<float> + TensorPrimitives. -->
     <PackageReference Include="System.Numerics.Tensors" Version="9.0.0" />
   </ItemGroup>
 
