@@ -1,0 +1,66 @@
+name: release
+
+# Weekly release train, Mondays at 09:00 America/Los_Angeles.
+# GitHub cron is UTC with no DST, so we fire at both UTC times that can map to
+# 09:00 Pacific (17:00 UTC during PST, 16:00 UTC during PDT) and let the gate job
+# keep only the run where it is actually 09:00 in Los Angeles. Also on-demand.
+on:
+  schedule:
+    - cron: "0 16 * * 1"
+    - cron: "0 17 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"        # manual runs always proceed
+          elif [ "$(TZ=America/Los_Angeles date +%H)" = "09" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"        # 09:00 Pacific
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"       # the other DST candidate; skip
+          fi
+
+  test:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]"
+      - run: pytest -q -m "not slow"
+
+  release:
+    needs: [gate, test]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      # Publishes the current pyproject version; if it is already on PyPI (you
+      # did not bump it this week) it no-ops instead of failing.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

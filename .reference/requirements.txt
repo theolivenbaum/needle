@@ -1,12 +1,7 @@
+huggingface_hub
+numpy
 jax
 jaxlib
 flax
 optax
-datasets
-huggingface_hub
-gcsfs
-transformers
-wandb
-pyyaml
 sentencepiece
-google-genai
