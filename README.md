@@ -89,7 +89,8 @@ score dropping accordingly.
 ```
 needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
 needle run        --weights <dir|file|.cact> --tokens 2,100,200 [--max-new 32]
-needle info       --weights <dir|file|.cact>
+needle info       --weights <dir|file|.cact> [--dense]
+needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
 needle parity     --fixtures <dir> [--tolerance 0.01] [--verbose]
 needle cact-check --cact <file> --expected <dir> [--tolerance 1e-4] [--verbose]
 ```
@@ -154,13 +155,47 @@ scripts/parity/           the Python side of those harnesses
 .reference/               upstream, vendored verbatim
 ```
 
-## Performance
+## Quantized weights
 
-Single-threaded decode is memory-bound: 43M float32 parameters is ~170 MB of
-weight traffic per token, so throughput tracks memory bandwidth rather than
-FLOPs. On a 4-core 2.8 GHz Xeon VM that is roughly 40 tokens/s decode, with
-prefill parallelised across cores. Keeping the weights quantised and
-dequantising inside the matmul is the obvious next step and is not implemented.
+A `.cact` blob runs on its packed Cactus-Quant codes by default — the weights are
+never expanded. The trick is the rotation the codec already applies: a group
+reconstructs as `w = (codebook[idx] * norm) @ H` with `H` symmetric and
+orthonormal, so
+
+```
+x · (q @ H) = (x @ H) · q
+```
+
+Transforming the *activation* once per group replaces transforming every weight
+row, and what is left is a dot product against 2-bit codebook indices — for
+which a 256-entry table maps each byte to the four values it encodes, one vector
+multiply-add per four weights.
+
+```sh
+needle bench --weights needle2.cact          # packed
+needle bench --weights needle2.cact --dense  # expanded to float32
+```
+
+|              | packed | float32 |
+|---|---|---|
+| weights      | **13.6 MB** (2.50 bits/parameter) | 173.1 MB |
+| prefill      | 159 tok/s | 302 tok/s |
+| decode       | 53 tok/s  | 48 tok/s  |
+| allocated    | 33 KB/token | 37 KB/token |
+
+Both produce identical token streams. The footprint is the point: 13.6 MB of
+weights plus a 4.7 MB scratch arena and a bounded KV cache is what makes the
+model fit the memory budget it was designed for. On a 4-core 2.8 GHz Xeon VM the
+speeds are close enough that either is usable; prefill favours float32 because
+dense GEMM vectorises eight lanes wide against the codec's four.
+
+Per-token garbage is down from ~295 KB to ~33 KB: layer temporaries come from a
+pooled bump arena that rewinds between layers, the engram sites stream their
+convolution history in a ring buffer instead of recomputing a twelve-token
+window each step, and the logits row and attention plan are reused across steps.
+
+Numbers above were measured after a warm-up pass over the real shapes — tiered
+JIT needs it, and timing a cold run measures the interpreter.
 
 ## Relationship to upstream
 

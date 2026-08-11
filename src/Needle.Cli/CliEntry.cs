@@ -21,9 +21,10 @@ public static class CliEntry
         Usage:
           needle parity     --fixtures <dir> [--tolerance 0.01] [--verbose]
           needle cact-check --cact <file> --expected <dir> [--tolerance 1e-4] [--verbose]
-          needle info       --weights <dir|file|.cact> [--config <path>]
-          needle run        --weights <dir|file|.cact> [--config <path>] --tokens 2,100 [--max-new 32]
+          needle info       --weights <dir|file|.cact> [--config <path>] [--dense]
+          needle run        --weights <dir|file|.cact> [--config <path>] --tokens 2,100 [--max-new 32] [--dense]
           needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
+          needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
 
         Commands:
           parity      Compare this implementation against the JAX reference, stage
@@ -34,9 +35,14 @@ public static class CliEntry
                       from scripts/parity/dump_cact.py.
           info        Print the geometry, parameter count and KV budget.
           run         Greedy-decode from raw token IDs with the KV-cached session.
+          bench       Time prefill and decode separately, and report weight
+                      storage, scratch high-water and bytes allocated per token.
 
         Weights may be a .cact blob, a directory holding weights.safetensors +
         config.json, or a .safetensors file (pass --config alongside it).
+
+        A .cact blob runs on its packed Cactus-Quant weights by default; --dense
+        expands them to float32 instead.
         """;
 
     public static int Run(string[] args)
@@ -57,6 +63,7 @@ public static class CliEntry
                 "info" => RunInfo(rest),
                 "run" => RunGenerate(rest),
                 "call" => RunCall(rest),
+                "bench" => RunBench(rest),
                 _ => Unknown(args[0]),
             };
         }
@@ -194,6 +201,9 @@ public static class CliEntry
         var model = LoadModel(options);
         Describe(model.Config);
         Console.WriteLine($"  parameters       {model.Weights.ParameterCount / 1e6:F2}M");
+        Console.WriteLine($"  weight storage   {model.Weights.ByteSize / 1e6:F1} MB "
+                          + $"({(model.Weights.IsQuantized ? "packed Cactus-Quant" : "float32")}, "
+                          + $"{model.Weights.ByteSize * 8.0 / model.Weights.ParameterCount:F2} bits/parameter)");
         Console.WriteLine($"  heads present    "
                           + $"mtp={(model.Weights.Mtp is not null ? "yes" : "no")} "
                           + $"contrastive={(model.Weights.Contrastive is not null ? "yes" : "no")} "
@@ -288,6 +298,55 @@ public static class CliEntry
     private static string ReadInline(string value) =>
         value.StartsWith('@') ? File.ReadAllText(value[1..]) : value;
 
+    // ── bench ────────────────────────────────────────────────────────────────
+
+    private static int RunBench(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        var model = LoadModel(options);
+        int promptLength = int.Parse(options.Get("prompt", "128"));
+        int decodeSteps = int.Parse(options.Get("decode", "64"));
+
+        var prompt = new int[promptLength];
+        prompt[0] = 2;
+        for (int i = 1; i < promptLength; i++) prompt[i] = (i * 37 + 11) % 8000 + 1;
+
+        // Tiered JIT promotes a method after roughly thirty calls and needs
+        // on-stack replacement for the long loops, so warm up on the real
+        // shapes — a token or two of warm-up measures the interpreter.
+        int warmupSteps = System.Math.Max(40, decodeSteps / 2);
+        var warmup = new NeedleSession(model, capacity: promptLength + warmupSteps + 8);
+        warmup.Generate(prompt, maxNewTokens: warmupSteps);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        var session = new NeedleSession(model, capacity: promptLength + decodeSteps + 8);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        var prefill = Stopwatch.StartNew();
+        var logits = session.Advance(prompt);
+        prefill.Stop();
+        long prefillBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        before = GC.GetAllocatedBytesForCurrentThread();
+        var decode = Stopwatch.StartNew();
+        for (int i = 0; i < decodeSteps; i++)
+            logits = session.Advance(Ops.ArgMax(logits.ReadSpan));
+        decode.Stop();
+        long decodeBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Console.WriteLine($"weights          {model.Weights.ByteSize / 1e6:F1} MB "
+                          + $"({(model.Weights.IsQuantized ? "packed Cactus-Quant" : "float32")})");
+        Console.WriteLine($"scratch arena    {model.ScratchHighWater * 4 / 1e6:F2} MB high water");
+        Console.WriteLine($"prefill          {promptLength} tokens in {prefill.Elapsed.TotalMilliseconds:F0} ms "
+                          + $"({promptLength * 1000.0 / prefill.Elapsed.TotalMilliseconds:F0} tok/s), "
+                          + $"{prefillBytes / 1024.0:F0} KB allocated");
+        Console.WriteLine($"decode           {decodeSteps} tokens in {decode.Elapsed.TotalMilliseconds:F0} ms "
+                          + $"({decodeSteps * 1000.0 / decode.Elapsed.TotalMilliseconds:F1} tok/s), "
+                          + $"{decodeBytes / (double)decodeSteps / 1024.0:F1} KB allocated per token");
+        return 0;
+    }
+
     // ── shared ───────────────────────────────────────────────────────────────
 
     private static Needle2Model LoadModel(ArgParser options)
@@ -301,8 +360,16 @@ public static class CliEntry
             var template = options.GetOrNull("config") is { } configFile
                 ? CheckpointConfig.Load(configFile)
                 : new TransformerConfig();
-            var loaded = CactLayout.Load(weights, template);
-            return new Needle2Model(Needle2Weights.FromFlat(loaded.Config, loaded.Parameters));
+
+            // Packed by default: the weights stay at two bits each and
+            // dequantisation folds into the matmul. --dense expands them to
+            // float32 instead, which is what the training flow wants.
+            if (options.GetFlag("dense"))
+            {
+                var expanded = CactLayout.Load(weights, template);
+                return new Needle2Model(Needle2Weights.FromFlat(expanded.Config, expanded.Parameters));
+            }
+            return new Needle2Model(CactWeights.Load(weights, template).Weights);
         }
 
         string configPath = options.GetOrNull("config")

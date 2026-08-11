@@ -33,10 +33,12 @@ public sealed class SequenceMask
     public SequenceMask(int length, int window = 0, bool[]? valid = null, bool[]? sink = null)
     {
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
-        if (valid is not null && valid.Length != length)
-            throw new ArgumentException($"valid must have {length} entries.", nameof(valid));
-        if (sink is not null && sink.Length != length)
-            throw new ArgumentException($"sink must have {length} entries.", nameof(sink));
+        // Longer buffers are fine: a session keeps one array at full capacity and
+        // passes it every step rather than slicing a copy.
+        if (valid is not null && valid.Length < length)
+            throw new ArgumentException($"valid must cover {length} positions.", nameof(valid));
+        if (sink is not null && sink.Length < length)
+            throw new ArgumentException($"sink must cover {length} positions.", nameof(sink));
 
         Length = length;
         Window = System.Math.Max(0, window);

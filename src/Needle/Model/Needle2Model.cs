@@ -49,6 +49,11 @@ public sealed class Needle2Model
     private readonly RoPE _rope;
     private readonly float _embedScale;
 
+    // Pooled per-pass state.  A model instance is single-threaded, so one arena
+    // and one lane buffer serve every layer of every step.
+    private readonly ScratchArena _scratch = new();
+    private readonly StackStatePool _stacks = new();
+
     /// <summary>Geometry of this model.</summary>
     public TransformerConfig Config => _cfg;
 
@@ -57,6 +62,9 @@ public sealed class Needle2Model
 
     /// <summary>Shared RoPE tables, sized to <see cref="TransformerConfig.MaxSeqLen"/>.</summary>
     public RoPE Rope => _rope;
+
+    /// <summary>Peak scratch demand in floats, for sizing diagnostics.</summary>
+    public long ScratchHighWater => _scratch.HighWater;
 
     public Needle2Model(Needle2Weights weights)
     {
@@ -79,7 +87,8 @@ public sealed class Needle2Model
             if ((uint)id >= (uint)_cfg.VocabSize)
                 throw new ArgumentOutOfRangeException(nameof(tokens),
                     $"Token {id} at position {t} is outside the vocabulary ({_cfg.VocabSize}).");
-            TensorPrimitives.Multiply(_w.Embedding.ReadRow(id), _embedScale, x.Row(t));
+            _w.Embedding.Row(id, x.Row(t));
+            TensorPrimitives.Multiply(x.ReadRow(t), _embedScale, x.Row(t));
         }
         return x;
     }
@@ -92,19 +101,28 @@ public sealed class Needle2Model
         int d = _cfg.DModel, v = _cfg.VocabSize;
         int t = hidden.Length / d;
         var logits = new NdArray(t, v);
-        Ops.MatMulTransposed(hidden.ReadSpan, _w.Embedding.ReadSpan, logits.Span, t, d, v);
+        _w.Embedding.Project(hidden.Reshape(t, d), logits);
         return logits;
     }
 
     /// <summary>Logits for the last position only — the one generation needs.</summary>
     public NdArray LastLogits(NdArray hidden)
     {
+        var logits = new NdArray(1, _cfg.VocabSize);
+        LastLogitsInto(hidden, logits);
+        return logits.Reshape(_cfg.VocabSize);
+    }
+
+    /// <summary>
+    /// Logits for the last position, written into <paramref name="destination"/>
+    /// — a whole vocabulary row is 32 KB, so a decoding session reuses one buffer
+    /// rather than allocating per step.
+    /// </summary>
+    public void LastLogitsInto(NdArray hidden, NdArray destination)
+    {
         int d = _cfg.DModel;
         int t = hidden.Length / d;
-        var last = hidden.Reshape(t, d).Slice(t - 1);
-        var logits = new NdArray(_cfg.VocabSize);
-        Ops.MatMulTransposed(last.ReadSpan, _w.Embedding.ReadSpan, logits.Span, 1, d, _cfg.VocabSize);
-        return logits;
+        _w.Embedding.Project(hidden.Reshape(t, d).SliceRange(t - 1, 1), destination);
     }
 
     // ── Full forward pass ────────────────────────────────────────────────────
@@ -158,22 +176,34 @@ public sealed class Needle2Model
         var x0 = Embed(tokens);
         trace?.Record("embed", x0);
 
-        var stack = new StackState(_cfg, seqLen);
+        var stack = _stacks.Rent(_cfg, seqLen);
         stack.Initialise(x0);
 
         var cells = collectCells ? new NdArray(seqLen, _cfg.NumLayers + 1, _cfg.DModel) : null;
         if (cells is not null) CopyCell(x0, cells, 0);
 
+        // Every layer wants the same temporaries, so they come out of one pooled
+        // arena that rewinds between layers rather than off the heap.
+        var scratch = _scratch;
         for (int layer = 0; layer < _cfg.NumLayers; layer++)
         {
-            RunLayer(layer, stack, plan, engram, startPosition, caches?[layer], trace);
-            if (cells is not null) CopyCell(stack.LaneMean(), cells, layer + 1);
+            scratch.Reset();
+            RunLayer(layer, stack, plan, engram, startPosition, caches?[layer], trace, scratch);
+            if (cells is not null)
+            {
+                var mark = scratch.Mark;
+                CopyCell(stack.LaneMean(scratch), cells, layer + 1);
+                scratch.RewindTo(mark);
+            }
         }
+        scratch.Reset();
 
-        var hidden = stack.LaneMean();
+        var hidden = new NdArray(seqLen, _cfg.DModel);
+        stack.LaneMeanInto(hidden);
         Ops.ZcRmsNorm(hidden, _w.FinalNorm.ReadSpan);
         trace?.Record("hidden", hidden);
 
+        _stacks.Return(stack);
         return new ForwardResult(hidden, cells);
     }
 
@@ -194,21 +224,22 @@ public sealed class Needle2Model
     /// matrix and the write gate.
     /// </summary>
     private void RunLayer(int layer, StackState stack, AttentionPlan plan, EngramActivations? engram,
-                          int startPosition, LayerKvCache? cache, ITrace? trace)
+                          int startPosition, LayerKvCache? cache, ITrace? trace, ScratchArena scratch)
     {
         int lanes = _cfg.MhcLanes, d = _cfg.DModel, seqLen = stack.SeqLen;
         var m = _w.Mhc[layer];
 
         // nx = rms_unit(x.reshape(T, lanes*D)) — the shared read of every lane.
-        var nx = stack.Lanes.Reshape(seqLen, lanes * d).Clone();
+        var nx = scratch.Take(seqLen, lanes * d);
+        stack.Lanes.ReadSpan.CopyTo(nx.Span);
         Ops.RmsUnit(nx);
 
         // hpre = sigmoid(a_pre * (nx @ phi_pre) + b_pre + pre_off)
-        var hpre = Ops.MatMul(nx, m.PhiPre);
+        var hpre = m.PhiPre.Apply(nx, scratch);
         ApplyGate(hpre, m.APre, m.BPre.ReadSpan, m.PreOffset, doubled: false);
 
         // u = einsum("btn,btnc->btc", hpre, x)
-        var u = new NdArray(seqLen, d);
+        var u = scratch.Take(seqLen, d, clear: true);
         for (int t = 0; t < seqLen; t++)
         {
             var dst = u.Row(t);
@@ -226,22 +257,23 @@ public sealed class Needle2Model
         int site = _cfg.EngramLayers.IndexOf(layer);
         if (site >= 0 && engram is not null)
         {
-            blockInput = u.Clone();
-            InjectEngram(blockInput, engram.Keys[site], engram.Values[site], trace, layer);
+            blockInput = scratch.Take(seqLen, d);
+            u.ReadSpan.CopyTo(blockInput.Span);
+            InjectEngram(blockInput, engram.Keys[site], engram.Values[site], trace, layer, scratch);
             trace?.Record($"layer{layer:D2}.bx", blockInput);
         }
 
         // y = block(bx) - u
-        var y = RunBlock(blockInput, _w.Layers[layer], plan, trace, layer, startPosition, cache);
+        var y = RunBlock(blockInput, _w.Layers[layer], plan, trace, layer, startPosition, cache, scratch);
         TensorPrimitives.Subtract(y.Span, u.ReadSpan, y.Span);
         trace?.Record($"layer{layer:D2}.y", y);
 
         // hpost = 2 * sigmoid(a_post * (nx @ phi_post) + b_post + post_off)
-        var hpost = Ops.MatMul(nx, m.PhiPost);
+        var hpost = m.PhiPost.Apply(nx, scratch);
         ApplyGate(hpost, m.APost, m.BPost.ReadSpan, m.PostOffset, doubled: true);
 
         // hres = sinkhorn(a_res * (nx @ phi_res) + b_res)
-        var res = Ops.MatMul(nx, m.PhiRes);
+        var res = m.PhiRes.Apply(nx, scratch);
         var resSpan = res.Span;
         var bRes = m.BRes.ReadSpan;
         for (int t = 0; t < seqLen; t++)
@@ -288,26 +320,31 @@ public sealed class Needle2Model
     /// <param name="startPosition">Absolute position of <c>x[0]</c>.</param>
     /// <param name="cache">Optional KV cache for incremental decoding.</param>
     public NdArray RunBlock(NdArray x, BlockWeights w, AttentionPlan plan, ITrace? trace = null,
-                            int layer = -1, int startPosition = 0, LayerKvCache? cache = null)
+                            int layer = -1, int startPosition = 0, LayerKvCache? cache = null,
+                            ScratchArena? scratch = null)
     {
         int d = _cfg.DModel;
         int seqLen = x.Length / d;
+        scratch ??= _scratch;
 
-        var normed = x.Clone();
+        var normed = scratch.Take(seqLen, d);
+        x.ReadSpan.CopyTo(normed.Span);
         Ops.ZcRmsNorm(normed, w.NormIn.ReadSpan);
 
-        var attn = Attention(normed, w, plan, startPosition, cache);
+        var attn = Attention(normed, w, plan, startPosition, cache, scratch);
         Ops.ZcRmsNorm(attn, w.PostAttnNorm.ReadSpan);
         if (layer >= 0) trace?.Record($"layer{layer:D2}.attn", attn);
 
         // h = x + sigmoid(attn_gate) * attn
         float gate = Sigmoid(w.AttnGate);
-        var h = x.Clone();
+        var h = scratch.Take(seqLen, d);
+        x.ReadSpan.CopyTo(h.Span);
         Ops.AddScaled(h.Span, attn.ReadSpan, gate);
 
-        var mlpIn = h.Clone();
+        var mlpIn = scratch.Take(seqLen, d);
+        h.ReadSpan.CopyTo(mlpIn.Span);
         Ops.ZcRmsNorm(mlpIn, w.PreHadaNorm.ReadSpan);
-        var mlp = HadamardMlp(mlpIn, w, seqLen);
+        var mlp = HadamardMlp(mlpIn, w, seqLen, scratch);
         if (layer >= 0) trace?.Record($"layer{layer:D2}.mlp", mlp);
 
         Ops.Add(h.Span, mlp.ReadSpan);
@@ -318,19 +355,18 @@ public sealed class Needle2Model
     /// Two orthonormal Walsh transforms sandwiching a SiLU, with a learned
     /// diagonal in front of each.  Port of <c>HadamardMLP</c>.
     /// </summary>
-    private NdArray HadamardMlp(NdArray x, BlockWeights w, int seqLen)
+    private NdArray HadamardMlp(NdArray x, BlockWeights w, int seqLen, ScratchArena scratch)
     {
         int d = _cfg.DModel, n = _cfg.HadamardWidth;
 
-        NdArray z;
+        var z = scratch.Take(seqLen, n, clear: n != d);
         if (n == d)
         {
-            z = x.Clone();
+            x.ReadSpan.CopyTo(z.Span);
         }
         else
         {
-            z = new NdArray(seqLen, n);
-            for (int t = 0; t < seqLen; t++) x.ReadRow(t).CopyTo(z.Row(t));
+            for (int t = 0; t < seqLen; t++) x.ReadRow(t).CopyTo(z.Row(t)[..d]);
         }
 
         Ops.MultiplyRows(z, w.D1.ReadSpan);
@@ -342,7 +378,7 @@ public sealed class Needle2Model
 
         if (n == d) return z;
 
-        var trimmed = new NdArray(seqLen, d);
+        var trimmed = scratch.Take(seqLen, d);
         for (int t = 0; t < seqLen; t++) z.ReadRow(t)[..d].CopyTo(trimmed.Row(t));
         return trimmed;
     }
@@ -363,16 +399,18 @@ public sealed class Needle2Model
     /// positions and the whole cache is attended over, which is what turns the
     /// same routine into the incremental decoder.
     /// </param>
-    public NdArray Attention(NdArray x, BlockWeights w, AttentionPlan plan, int startPosition, LayerKvCache? cache)
+    public NdArray Attention(NdArray x, BlockWeights w, AttentionPlan plan, int startPosition,
+                             LayerKvCache? cache, ScratchArena? scratch = null)
     {
+        scratch ??= _scratch;
         int d = _cfg.DModel, a = _cfg.AttnWidth, kvDim = _cfg.KvDim;
         int heads = _cfg.NumHeads, kvHeads = _cfg.NumKvHeads, headDim = _cfg.HeadDim;
         int repeats = heads / kvHeads;
         int seqLen = x.Length / d;
 
-        var q = Ops.MatMul(x, w.QProj).Reshape(seqLen, a);
-        var k = Ops.MatMul(x, w.KProj).Reshape(seqLen, kvDim);
-        var v = Ops.MatMul(x, w.VProj).Reshape(seqLen, kvDim);
+        var q = w.QProj.Apply(x, scratch);
+        var k = w.KProj.Apply(x, scratch);
+        var v = w.VProj.Apply(x, scratch);
 
         NormHeads(q, heads, headDim, w.QNorm.ReadSpan);
         NormHeads(k, kvHeads, headDim, w.KNorm.ReadSpan);
@@ -387,9 +425,9 @@ public sealed class Needle2Model
             values = cache.Values;
         }
 
-        var context = new NdArray(seqLen, a);
+        var context = scratch.Take(seqLen, a);
         float scale = 1f / MathF.Sqrt(headDim);
-        var scoreBuffer = new float[System.Math.Max(1, plan.MaxKeys)];
+        var scoreBuffer = scratch.TakeSpan(System.Math.Max(1, plan.MaxKeys));
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -402,7 +440,7 @@ public sealed class Needle2Model
                 outHead.Clear();
                 if (allowed.Length == 0) continue;
 
-                var scores = scoreBuffer.AsSpan(0, allowed.Length);
+                var scores = scoreBuffer[..allowed.Length];
                 for (int i = 0; i < allowed.Length; i++)
                 {
                     scores[i] = TensorPrimitives.Dot(
@@ -416,11 +454,11 @@ public sealed class Needle2Model
         }
 
         // out *= sigmoid(x @ gate_proj)
-        var gate = Ops.MatMul(x, w.GateProj);
+        var gate = w.GateProj.Apply(x, scratch);
         Ops.Sigmoid(gate.Span);
         Ops.Multiply(context.Span, gate.ReadSpan);
 
-        return Ops.MatMul(context, w.OutProj);
+        return w.OutProj.Apply(context, scratch);
     }
 
     /// <summary>Zero-centred RMSNorm applied independently to each head.</summary>
@@ -528,6 +566,61 @@ public sealed class Needle2Model
     }
 
     /// <summary>
+    /// Project one site's hashed rows for positions
+    /// <c>[startPosition, startPosition + count)</c>, before the causal
+    /// convolution.
+    ///
+    /// This is the piece a session can compute incrementally: the hash reaches
+    /// back only <c>maxOrder - 1</c> tokens, so a step needs no window at all.
+    /// The taps that do need history are applied by <see cref="Inference.EngramStream"/>
+    /// from its own ring buffer.
+    /// </summary>
+    /// <param name="site">Engram site index.</param>
+    /// <param name="history">Full token history; positions before 0 hash as zero.</param>
+    /// <param name="startPosition">First absolute position to produce.</param>
+    /// <param name="count">How many positions to produce.</param>
+    /// <param name="keys">Filled with the site's keys, [count, D].</param>
+    /// <param name="values">Filled with the pre-convolution value projections, [count, D].</param>
+    public void EngramRows(
+        int site, ReadOnlySpan<int> history, int startPosition, int count, NdArray keys, NdArray values)
+    {
+        var (orders, heads, subDim) = _cfg.EngramGeometry();
+        int tables = orders.Length * heads;
+        var weights = _w.Engrams[site];
+        var mark = _scratch.Mark;
+
+        var e = _scratch.Take(count, tables * subDim);
+        for (int i = 0; i < count; i++)
+        {
+            int position = startPosition + i;
+            var row = e.Row(i);
+
+            for (int oi = 0; oi < orders.Length; oi++)
+            {
+                // The n-gram is legal only once the token it reaches back to
+                // exists — the streaming form of _mask_diag.
+                bool legal = position - (orders[oi] - 1) >= 0;
+                for (int h = 0; h < heads; h++)
+                {
+                    int table = oi * heads + h;
+                    var slot = row.Slice(table * subDim, subDim);
+                    if (!legal)
+                    {
+                        slot.Clear();
+                        continue;
+                    }
+                    weights.Tables.Row(table,
+                        EngramHash.Index(history, position, orders[oi], table, _cfg.EngramSlots), slot);
+                }
+            }
+        }
+
+        weights.KeyProj.Apply(e, keys);
+        weights.ValueProj.Apply(e, values);
+        _scratch.RewindTo(mark);
+    }
+
+    /// <summary>
     /// Gather, project and causally convolve the engram rows, shared by the
     /// batched and cached paths.
     /// </summary>
@@ -557,15 +650,16 @@ public sealed class Needle2Model
                 for (int j = 0; j < tables; j++)
                 {
                     float ok = ngramOk[t * tables + j];
-                    var slot = site.Tables.Slice(j).ReadRow(indices[t * tables + j]);
-                    TensorPrimitives.Multiply(slot, ok, row.Slice(j * subDim, subDim));
+                    var slot = row.Slice(j * subDim, subDim);
+                    site.Tables.Row(j, indices[t * tables + j], slot);
+                    TensorPrimitives.Multiply(slot, ok, slot);
                 }
             }
 
-            keys[s] = Ops.MatMul(e, site.KeyProj);
+            keys[s] = site.KeyProj.Apply(e);
 
             // v[t] = sum_j taps[j] * v0[t - j*dilation] * tap_ok[j][t]
-            var v0 = Ops.MatMul(e, site.ValueProj);
+            var v0 = site.ValueProj.Apply(e);
             var v = new NdArray(seqLen, d);
             for (int j = 0; j < EngramConstants.ConvTaps; j++)
             {
@@ -600,18 +694,22 @@ public sealed class Needle2Model
     /// <c>u += sigmoid(&lt;rms_unit(u), rms_unit(k)&gt; / sqrt(D)) * v</c>.
     /// Port of the engram branch at the top of <c>Block.__call__</c>.
     /// </summary>
-    private void InjectEngram(NdArray u, NdArray keys, NdArray values, ITrace? trace, int layer)
+    private void InjectEngram(NdArray u, NdArray keys, NdArray values, ITrace? trace, int layer,
+                              ScratchArena scratch)
     {
         int d = _cfg.DModel;
         int seqLen = u.Length / d;
         float scale = 1f / MathF.Sqrt(d);
+        var mark = scratch.Mark;
 
-        var uUnit = u.Clone();
+        var uUnit = scratch.Take(seqLen, d);
+        u.ReadSpan.CopyTo(uUnit.Span);
         Ops.RmsUnit(uUnit);
-        var kUnit = keys.Clone();
+        var kUnit = scratch.Take(seqLen, d);
+        keys.ReadSpan.CopyTo(kUnit.Span);
         Ops.RmsUnit(kUnit);
 
-        var alpha = new float[seqLen];
+        var alpha = scratch.TakeSpan(seqLen);
         for (int t = 0; t < seqLen; t++)
         {
             float dot = TensorPrimitives.Dot(uUnit.ReadRow(t), kUnit.ReadRow(t)) * scale;
@@ -619,7 +717,13 @@ public sealed class Needle2Model
             Ops.AddScaled(u.Row(t), values.ReadRow(t), alpha[t]);
         }
 
-        trace?.Record($"layer{layer:D2}.engram_alpha", new NdArray(alpha, 0, seqLen));
+        if (trace is not null)
+        {
+            var record = new NdArray(seqLen);
+            alpha.CopyTo(record.Span);
+            trace.Record($"layer{layer:D2}.engram_alpha", record);
+        }
+        scratch.RewindTo(mark);
     }
 
     // ── Pooled heads ─────────────────────────────────────────────────────────
@@ -679,8 +783,7 @@ public sealed class Needle2Model
         var result = Forward(tokens, mask, collectCells: true);
         var pooled = ProbePool(result.Cells!, head.Probes, KeepFlags(tokens));
 
-        var embedding = Ops.MatMul(pooled.Reshape(1, pooled.Length), head.Proj)
-                           .Reshape(_cfg.ContrastiveDim);
+        var embedding = head.Proj.Apply(pooled.Reshape(1, pooled.Length)).Reshape(_cfg.ContrastiveDim);
         var span = embedding.Span;
         float norm = MathF.Sqrt(TensorPrimitives.Dot(span, span) + 1e-12f);
         Ops.Scale(span, 1f / norm);
@@ -700,7 +803,7 @@ public sealed class Needle2Model
         var result = Forward(tokens, mask, collectCells: true);
         var pooled = ProbePool(result.Cells!, head.Probes, KeepFlags(tokens));
 
-        return TensorPrimitives.Dot(pooled.ReadSpan, head.Proj.ReadSpan) + head.Bias;
+        return head.Proj.Apply(pooled.Reshape(1, pooled.Length))[0] + head.Bias;
     }
 
     /// <summary>Sigmoid of a scalar.</summary>

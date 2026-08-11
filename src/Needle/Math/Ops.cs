@@ -95,6 +95,16 @@ public static class Ops
     private static void MatMulRows(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
                                    int first, int rows, int k, int n)
     {
+        // The hyper-connection gates project 2048 inputs onto 4 or 16 outputs.
+        // Streaming that as one vector call per input row means thousands of
+        // calls over four-element spans, where the call overhead dwarfs the
+        // arithmetic — so accumulate narrow outputs by hand instead.
+        if (n <= 16)
+        {
+            MatMulNarrow(a, b, c, first, rows, k, n);
+            return;
+        }
+
         int i = first;
         for (; i + 4 <= first + rows; i += 4)
         {
@@ -127,6 +137,33 @@ public static class Ops
                 float scale = aRow[p];
                 if (scale != 0f) TensorPrimitives.MultiplyAdd(b.Slice(p * n, n), scale, row, row);
             }
+        }
+    }
+
+    /// <summary>
+    /// GEMM for a narrow output: accumulates <paramref name="n"/> ≤ 16 columns in
+    /// registers while streaming the reduction axis, so the whole product is one
+    /// pass with no per-row call overhead.
+    /// </summary>
+    private static void MatMulNarrow(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+                                     int first, int rows, int k, int n)
+    {
+        Span<float> accumulator = stackalloc float[16];
+
+        for (int i = first; i < first + rows; i++)
+        {
+            accumulator[..n].Clear();
+            var aRow = a.Slice(i * k, k);
+
+            for (int p = 0; p < k; p++)
+            {
+                float scale = aRow[p];
+                if (scale == 0f) continue;
+                var bRow = b.Slice(p * n, n);
+                for (int j = 0; j < n; j++) accumulator[j] += scale * bRow[j];
+            }
+
+            accumulator[..n].CopyTo(c.Slice(i * n, n));
         }
     }
 

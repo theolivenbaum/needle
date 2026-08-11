@@ -89,15 +89,55 @@ public sealed class StackState
     public NdArray LaneMean()
     {
         var mean = new NdArray(SeqLen, _d);
+        LaneMeanInto(mean);
+        return mean;
+    }
+
+    /// <summary>The lane average, taken from <paramref name="scratch"/>.</summary>
+    public NdArray LaneMean(ScratchArena scratch)
+    {
+        var mean = scratch.Take(SeqLen, _d);
+        LaneMeanInto(mean);
+        return mean;
+    }
+
+    /// <summary>Write the lane average into an existing [T, D] tensor.</summary>
+    public void LaneMeanInto(NdArray destination)
+    {
         float inv = 1f / _lanes;
         for (int t = 0; t < SeqLen; t++)
         {
-            var dst = mean.Row(t);
-            for (int n = 0; n < _lanes; n++) Ops.Add(dst, ReadLane(t, n));
+            var dst = destination.Row(t);
+            ReadLane(t, 0).CopyTo(dst);
+            for (int n = 1; n < _lanes; n++) Ops.Add(dst, ReadLane(t, n));
             TensorPrimitives.Multiply(dst, inv, dst);
         }
-        return mean;
     }
+}
+
+/// <summary>
+/// Reuses lane buffers across forward passes.  Sequence lengths repeat — one
+/// prompt length during prefill, then a single token for every decode step — so
+/// a tiny cache keyed by length avoids reallocating the [T, lanes, D] working
+/// set on every step.
+/// </summary>
+public sealed class StackStatePool
+{
+    private readonly Dictionary<int, StackState> _byLength = [];
+
+    /// <summary>Borrow a state for <paramref name="seqLen"/> positions.</summary>
+    public StackState Rent(TransformerConfig config, int seqLen)
+    {
+        if (_byLength.TryGetValue(seqLen, out var cached)) return cached;
+
+        var state = new StackState(config, seqLen);
+        // Only bound the cache; prefill lengths vary, decode is always one.
+        if (_byLength.Count < 8) _byLength[seqLen] = state;
+        return state;
+    }
+
+    /// <summary>Hand a state back.  Contents are not preserved.</summary>
+    public void Return(StackState state) { _ = state; }
 }
 
 /// <summary>

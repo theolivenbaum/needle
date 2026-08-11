@@ -21,6 +21,7 @@ previous port was rewritten rather than extended: no TorchSharp, no
 | `model/finetune.py` — `render_example`, JSONL contract | `Tokenizer/ChatMarkers.cs` (`ChatTemplate`), `Training/JsonlDataset.cs` | unit tests |
 | `needle/__init__.py` — the `Needle` session API | `Inference/NeedleAgent.cs` | end-to-end calls from `needle2.cact` |
 | `architecture.py` — `kv_budget_window` | `Model/SequenceMask.cs` (`KvBudget`) | unit tests |
+| `model/quantize.py` — inference on packed weights | `Weights/QuantizedMatrix.cs`, `Weights/CactWeights.cs`, `Model/WeightViews.cs` | identical token streams to the float32 path |
 | n/a — safetensors interchange | `Weights/Safetensors.cs` | round-trips the reference dumps |
 | grammar-constrained decoding (upstream moved this into its compiled engine) | `Inference/ConstrainedDecoding.cs`, wired into `NeedleAgent` | unit tests; observed to correct an out-of-schema argument on a real call |
 
@@ -51,9 +52,12 @@ it — end-to-end argmax still mostly agreed.
 
 Inference-side gaps, in rough order of usefulness:
 
-- **Quantised inference.** Weights are dequantised to float32 at load. Keeping
-  them packed and dequantising inside the matmul would cut both memory (170 MB →
-  ~15 MB) and the bandwidth that currently bounds decode.
+- **The packed path is not faster, only smaller.** 13.6 MB against 173 MB, at
+  roughly the same decode rate and about half the prefill rate. The 2-bit inner
+  loop moves four weights per vector operation where dense float32 moves eight or
+  sixteen; closing that needs real intrinsics (masked accumulation per codebook
+  entry, or a wider byte table) rather than portable `Vector4`.
+
 - **The grammar only constrains names and argument keys**, not argument *values*.
   Upstream's engine also compiles `Field` constraints — ranges, patterns,
   lengths, enums, item counts — into the decode grammar, so a value that

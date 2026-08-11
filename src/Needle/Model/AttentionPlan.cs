@@ -13,18 +13,21 @@ public sealed class AttentionPlan
 {
     private readonly int[] _offsets;   // [queries + 1]
     private readonly int[] _keys;      // concatenated allowed key positions
+    private readonly int _used;        // keys actually filled
 
     /// <summary>Absolute position of the first query this plan covers.</summary>
     public int StartPosition { get; }
 
     /// <summary>Number of query positions.</summary>
-    public int QueryCount => _offsets.Length - 1;
+    public int QueryCount { get; }
 
-    private AttentionPlan(int startPosition, int[] offsets, int[] keys)
+    private AttentionPlan(int startPosition, int[] offsets, int[] keys, int queries, int used)
     {
         StartPosition = startPosition;
         _offsets = offsets;
         _keys = keys;
+        QueryCount = queries;
+        _used = used;
     }
 
     /// <summary>Allowed key positions for query <paramref name="index"/> (0-based within the plan).</summary>
@@ -76,9 +79,58 @@ public sealed class AttentionPlan
         }
         offsets[count] = keys.Count;
 
-        return new AttentionPlan(startPosition, offsets, keys.ToArray());
+        var flat = keys.ToArray();
+        return new AttentionPlan(startPosition, offsets, flat, count, flat.Length);
     }
 
     /// <summary>Resolve the whole sequence at once (the prefill case).</summary>
     public static AttentionPlan Build(SequenceMask mask) => Build(mask, 0, mask.Length, mask.Length);
+
+    /// <summary>
+    /// Rebuild in place over buffers this plan already owns.  A decode step
+    /// resolves the same shape every time, so reusing the arrays keeps the
+    /// per-token allocation at zero.
+    /// </summary>
+    private AttentionPlan Refill(SequenceMask mask, int startPosition, int count, int keyCount)
+    {
+        int written = 0;
+        for (int i = 0; i < count; i++)
+        {
+            _offsets[i] = written;
+            int query = startPosition + i;
+            int limit = System.Math.Min(query, keyCount - 1);
+            int start = mask.Window > 0 ? mask.WindowStart(query) : 0;
+
+            if (mask.Window > 0 && mask.HasSinks)
+                for (int j = 0; j < start; j++)
+                    if (mask.IsSink(j) && mask.IsValid(j)) _keys[written++] = j;
+
+            for (int j = start; j <= limit; j++)
+                if (mask.IsValid(j)) _keys[written++] = j;
+        }
+        _offsets[count] = written;
+        return new AttentionPlan(startPosition, _offsets, _keys, count, written);
+    }
+
+    /// <summary>
+    /// Reuses one plan's storage across steps.  Sized once for the worst case,
+    /// then refilled.
+    /// </summary>
+    public sealed class Builder
+    {
+        private AttentionPlan? _plan;
+
+        /// <summary>Resolve <paramref name="mask"/> for one window of queries.</summary>
+        public AttentionPlan Build(SequenceMask mask, int startPosition, int count, int keyCount)
+        {
+            int capacity = count * System.Math.Min(keyCount, MaxKeysPerQuery(mask, keyCount));
+            if (_plan is null || _plan._keys.Length < capacity || _plan._offsets.Length < count + 1)
+                _plan = new AttentionPlan(startPosition, new int[count + 1], new int[capacity], 0, 0);
+
+            return _plan.Refill(mask, startPosition, count, keyCount);
+        }
+
+        private static int MaxKeysPerQuery(SequenceMask mask, int keyCount) =>
+            mask.Window > 0 ? System.Math.Min(keyCount, mask.Window + keyCount) : keyCount;
+    }
 }

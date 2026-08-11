@@ -21,7 +21,11 @@ public sealed class NeedleSession
     private readonly int[] _history;
     private readonly bool[] _valid;
     private readonly bool[] _sink;
-    private readonly int _engramWindow;
+    private readonly AttentionPlan.Builder _plans = new();
+    private readonly NdArray _logits;
+    private readonly EngramStream? _engram;
+    private readonly NdArray[] _engramKeys;
+    private readonly NdArray[] _engramValues;
 
     /// <summary>Positions consumed so far.</summary>
     public int Length { get; private set; }
@@ -56,9 +60,24 @@ public sealed class NeedleSession
         _history = new int[Capacity];
         _valid = new bool[Capacity];
         _sink = new bool[Capacity];
+        _logits = new NdArray(1, _cfg.VocabSize);
 
-        var orders = _cfg.EngramOrders;
-        _engramWindow = orders.Length == 0 ? 0 : EngramConstants.ConvTaps * orders.Max();
+        if (_cfg.EngramSites > 0)
+        {
+            _engram = new EngramStream(model, Capacity);
+            _engramKeys = new NdArray[_cfg.EngramSites];
+            _engramValues = new NdArray[_cfg.EngramSites];
+            for (int s = 0; s < _cfg.EngramSites; s++)
+            {
+                _engramKeys[s] = new NdArray(Capacity, _cfg.DModel);
+                _engramValues[s] = new NdArray(Capacity, _cfg.DModel);
+            }
+        }
+        else
+        {
+            _engramKeys = [];
+            _engramValues = [];
+        }
     }
 
     /// <summary>Forget the conversation, keeping the allocated buffers.</summary>
@@ -66,6 +85,7 @@ public sealed class NeedleSession
     {
         Length = 0;
         foreach (var cache in _caches) cache.Reset();
+        _engram?.Reset();
         Array.Clear(_history);
         Array.Clear(_valid);
         Array.Clear(_sink);
@@ -83,6 +103,9 @@ public sealed class NeedleSession
     /// <summary>
     /// Consume <paramref name="tokens"/> and return the next-token logits from
     /// the final position.  Works for a whole prompt or for a single token.
+    ///
+    /// The returned tensor is session-owned scratch and is overwritten by the
+    /// next call; copy it if you need it to outlive the step.
     /// </summary>
     public NdArray Advance(ReadOnlySpan<int> tokens)
     {
@@ -97,12 +120,32 @@ public sealed class NeedleSession
         for (int i = 0; i < tokens.Length; i++) _valid[start + i] = true;
         Length += tokens.Length;
 
-        var mask = new SequenceMask(Length, Window, _valid[..Length], _sink[..Length]);
-        var plan = AttentionPlan.Build(mask, start, tokens.Length, Length);
+        var mask = new SequenceMask(Length, Window, _valid, _sink);
+        var plan = _plans.Build(mask, start, tokens.Length, Length);
         var engram = BuildEngram(start, tokens.Length);
 
         var result = _model.RunStack(tokens, plan, engram, start, _caches);
-        return _model.LastLogits(result.Hidden);
+        _model.LastLogitsInto(result.Hidden, _logits);
+        return _logits.Reshape(_cfg.VocabSize);
+    }
+
+    /// <summary>
+    /// Engram keys and values for the new positions, produced incrementally.
+    /// </summary>
+    private Needle2Model.EngramActivations? BuildEngram(int start, int count)
+    {
+        if (_engram is null) return null;
+
+        var keys = new NdArray[_engramKeys.Length];
+        var values = new NdArray[_engramValues.Length];
+        for (int s = 0; s < keys.Length; s++)
+        {
+            keys[s] = _engramKeys[s].SliceRange(0, count);
+            values[s] = _engramValues[s].SliceRange(0, count);
+        }
+
+        _engram.Advance(_history.AsSpan(0, Length), start, count, keys, values);
+        return new Needle2Model.EngramActivations(keys, values);
     }
 
     /// <summary>Consume a single token and return the next-token logits.</summary>
@@ -110,30 +153,6 @@ public sealed class NeedleSession
     {
         Span<int> one = [token];
         return Advance(one);
-    }
-
-    /// <summary>
-    /// Engram keys and values for positions <c>[start, start + count)</c>,
-    /// computed over the short trailing window the sites can actually reach.
-    /// </summary>
-    private Needle2Model.EngramActivations? BuildEngram(int start, int count)
-    {
-        if (_engramWindow == 0) return null;
-
-        int warmup = System.Math.Min(_engramWindow, start);
-        int lo = start - warmup;
-        int pad = _engramWindow - warmup;
-        int length = _engramWindow + count;
-
-        var windowTokens = new int[length];
-        var windowValid = new bool[length];
-        for (int i = 0; i < warmup + count; i++)
-        {
-            windowTokens[pad + i] = _history[lo + i];
-            windowValid[pad + i] = _valid[lo + i];
-        }
-
-        return _model.EngramWindow(windowTokens, windowValid, trim: _engramWindow);
     }
 
     /// <summary>

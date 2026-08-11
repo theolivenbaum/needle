@@ -20,11 +20,11 @@ namespace Needle.Model;
 /// <param name="D3">Hadamard output diagonal [n].</param>
 public sealed record BlockWeights(
     NdArray NormIn,
-    NdArray QProj,
-    NdArray KProj,
-    NdArray VProj,
-    NdArray GateProj,
-    NdArray OutProj,
+    LinearWeight QProj,
+    LinearWeight KProj,
+    LinearWeight VProj,
+    LinearWeight GateProj,
+    LinearWeight OutProj,
     NdArray QNorm,
     NdArray KNorm,
     NdArray PostAttnNorm,
@@ -51,9 +51,9 @@ public sealed record BlockWeights(
 /// <param name="PreOffset">Per-lane read offset, <c>8·onehot − 4</c> [lanes].</param>
 /// <param name="PostOffset">Per-lane write offset, <c>−4·(1 − onehot)</c> [lanes].</param>
 public sealed record MhcWeights(
-    NdArray PhiPre,
-    NdArray PhiPost,
-    NdArray PhiRes,
+    LinearWeight PhiPre,
+    LinearWeight PhiPost,
+    LinearWeight PhiRes,
     NdArray BPre,
     NdArray BPost,
     NdArray BRes,
@@ -72,22 +72,22 @@ public sealed record MhcWeights(
 /// <param name="ValueProj">Value kernel [tables*subDim, D].</param>
 /// <param name="Taps">Per-tap channel gains [ConvTaps, D].</param>
 public sealed record EngramWeights(
-    NdArray Tables,
-    NdArray KeyProj,
-    NdArray ValueProj,
+    EngramTable Tables,
+    LinearWeight KeyProj,
+    LinearWeight ValueProj,
     NdArray Taps);
 
 /// <summary>Probe-pooled contrastive head used for tool retrieval.</summary>
 /// <param name="Probes">Probe queries [4, D].</param>
 /// <param name="Proj">Projection [4*D, contrastiveDim].</param>
 /// <param name="LogTemp">Learned log-temperature.</param>
-public sealed record ContrastiveHeadWeights(NdArray Probes, NdArray Proj, float LogTemp);
+public sealed record ContrastiveHeadWeights(NdArray Probes, LinearWeight Proj, float LogTemp);
 
 /// <summary>Probe-pooled confidence head.</summary>
 /// <param name="Probes">Probe queries [8, D].</param>
 /// <param name="Proj">Projection [8*D, 1].</param>
 /// <param name="Bias">Output bias [1].</param>
-public sealed record ConfidenceHeadWeights(NdArray Probes, NdArray Proj, float Bias);
+public sealed record ConfidenceHeadWeights(NdArray Probes, LinearWeight Proj, float Bias);
 
 /// <summary>Auxiliary multi-token-prediction head.</summary>
 /// <param name="Combine">Kernel over [hidden ‖ next-token embedding] [2D, D].</param>
@@ -95,7 +95,7 @@ public sealed record ConfidenceHeadWeights(NdArray Probes, NdArray Proj, float B
 /// <param name="FinalNorm">Norm applied to the block output [D].</param>
 /// <param name="Block">The extra transformer block.</param>
 public sealed record MtpWeights(
-    NdArray Combine,
+    LinearWeight Combine,
     NdArray EmbNorm,
     NdArray FinalNorm,
     BlockWeights Block);
@@ -112,7 +112,7 @@ public sealed class Needle2Weights
     public TransformerConfig Config { get; }
 
     /// <summary>Token embedding, tied with the output projection [V, D].</summary>
-    public NdArray Embedding { get; }
+    public EmbeddingTable Embedding { get; }
 
     /// <summary>Per-layer block weights.</summary>
     public ImmutableArray<BlockWeights> Layers { get; }
@@ -137,7 +137,7 @@ public sealed class Needle2Weights
 
     private Needle2Weights(
         TransformerConfig config,
-        NdArray embedding,
+        EmbeddingTable embedding,
         ImmutableArray<BlockWeights> layers,
         ImmutableArray<MhcWeights> mhc,
         NdArray finalNorm,
@@ -156,6 +156,22 @@ public sealed class Needle2Weights
         Contrastive = contrastive;
         Confidence = confidence;
     }
+
+    /// <summary>
+    /// Assemble from already-built parts.  Used by the packed <c>.cact</c> path,
+    /// which produces quantised views rather than float32 tensors.
+    /// </summary>
+    public static Needle2Weights FromParts(
+        TransformerConfig config,
+        EmbeddingTable embedding,
+        ImmutableArray<BlockWeights> layers,
+        ImmutableArray<MhcWeights> mhc,
+        NdArray finalNorm,
+        ImmutableArray<EngramWeights> engrams,
+        MtpWeights? mtp,
+        ContrastiveHeadWeights? contrastive,
+        ConfidenceHeadWeights? confidence) =>
+        new(config, embedding, layers, mhc, finalNorm, engrams, mtp, contrastive, confidence);
 
     /// <summary>
     /// Build the weight set from a flat map keyed by Flax parameter path, e.g.
@@ -198,7 +214,7 @@ public sealed class Needle2Weights
             return tensor[0];
         }
 
-        var embedding = Get("embedding/embedding", config.VocabSize, d);
+        var embedding = new DenseEmbedding(Get("embedding/embedding", config.VocabSize, d));
 
         const string BlockPrefix = "stack/layers/block/";
         var normIn = Get(BlockPrefix + "ZCRMSNorm_0/scale", l, d);
@@ -220,8 +236,10 @@ public sealed class Needle2Weights
         for (int i = 0; i < l; i++)
         {
             layers.Add(new BlockWeights(
-                normIn.Slice(i), qProj.Slice(i), kProj.Slice(i), vProj.Slice(i),
-                gateProj.Slice(i), outProj.Slice(i), qNorm.Slice(i), kNorm.Slice(i),
+                normIn.Slice(i),
+                LinearWeight.Dense(qProj.Slice(i)), LinearWeight.Dense(kProj.Slice(i)),
+                LinearWeight.Dense(vProj.Slice(i)), LinearWeight.Dense(gateProj.Slice(i)),
+                LinearWeight.Dense(outProj.Slice(i)), qNorm.Slice(i), kNorm.Slice(i),
                 postNorm.Slice(i), attnGate[i], preHada.Slice(i),
                 hd1.Slice(i), hd2.Slice(i), hd3.Slice(i)));
         }
@@ -250,7 +268,8 @@ public sealed class Needle2Weights
                 postOff[n] = n == lane ? 0f : -4f;
             }
             mhc.Add(new MhcWeights(
-                phiPre.Slice(i), phiPost.Slice(i), phiRes.Slice(i),
+                LinearWeight.Dense(phiPre.Slice(i)), LinearWeight.Dense(phiPost.Slice(i)),
+                LinearWeight.Dense(phiRes.Slice(i)),
                 bPre.Slice(i), bPost.Slice(i), bRes.Slice(i),
                 aPre[i], aPost[i], aRes[i], preOff, postOff));
         }
@@ -261,9 +280,9 @@ public sealed class Needle2Weights
         for (int s = 0; s < config.EngramSites; s++)
         {
             engrams.Add(new EngramWeights(
-                Get($"engrams_{s}/embedding", tables, config.EngramSlots, subDim),
-                Get($"engrams_{s}/key_proj/kernel", tables * subDim, d),
-                Get($"engrams_{s}/value_proj/kernel", tables * subDim, d),
+                new DenseEngramTable(Get($"engrams_{s}/embedding", tables, config.EngramSlots, subDim)),
+                LinearWeight.Dense(Get($"engrams_{s}/key_proj/kernel", tables * subDim, d)),
+                LinearWeight.Dense(Get($"engrams_{s}/value_proj/kernel", tables * subDim, d)),
                 Get($"engrams_{s}/taps", EngramConstants.ConvTaps, d)));
         }
 
@@ -272,16 +291,16 @@ public sealed class Needle2Weights
         {
             const string P = "mtp_block/";
             mtp = new MtpWeights(
-                Get("mtp_combine/kernel", 2 * d, d),
+                LinearWeight.Dense(Get("mtp_combine/kernel", 2 * d, d)),
                 Get("mtp_emb_norm/scale", d),
                 Get("mtp_final_norm/scale", d),
                 new BlockWeights(
                     Get(P + "ZCRMSNorm_0/scale", d),
-                    Get(P + "self_attn/q_proj/kernel", d, a),
-                    Get(P + "self_attn/k_proj/kernel", d, kv),
-                    Get(P + "self_attn/v_proj/kernel", d, kv),
-                    Get(P + "self_attn/gate_proj/kernel", d, a),
-                    Get(P + "self_attn/out_proj/kernel", a, d),
+                    LinearWeight.Dense(Get(P + "self_attn/q_proj/kernel", d, a)),
+                    LinearWeight.Dense(Get(P + "self_attn/k_proj/kernel", d, kv)),
+                    LinearWeight.Dense(Get(P + "self_attn/v_proj/kernel", d, kv)),
+                    LinearWeight.Dense(Get(P + "self_attn/gate_proj/kernel", d, a)),
+                    LinearWeight.Dense(Get(P + "self_attn/out_proj/kernel", a, d)),
                     Get(P + "self_attn/q_norm/scale", hd),
                     Get(P + "self_attn/k_norm/scale", hd),
                     Get(P + "post_attn_norm/scale", d),
@@ -297,7 +316,8 @@ public sealed class Needle2Weights
         {
             contrastive = new ContrastiveHeadWeights(
                 Get("contrastive_head/probes", Needle2Model.ContrastiveProbes, d),
-                Get("contrastive_head/proj/kernel", Needle2Model.ContrastiveProbes * d, config.ContrastiveDim),
+                LinearWeight.Dense(
+                    Get("contrastive_head/proj/kernel", Needle2Model.ContrastiveProbes * d, config.ContrastiveDim)),
                 Scalar("contrastive_head/log_temp"));
         }
 
@@ -306,7 +326,7 @@ public sealed class Needle2Weights
         {
             confidence = new ConfidenceHeadWeights(
                 Get("confidence_head/probes", Needle2Model.ConfidenceProbes, d),
-                Get("confidence_head/proj/kernel", Needle2Model.ConfidenceProbes * d, 1),
+                LinearWeight.Dense(Get("confidence_head/proj/kernel", Needle2Model.ConfidenceProbes * d, 1)),
                 Scalar("confidence_head/proj/bias"));
         }
 
@@ -319,18 +339,46 @@ public sealed class Needle2Weights
     {
         get
         {
-            long n = Embedding.Length + FinalNorm.Length;
+            long n = (long)Embedding.VocabSize * Embedding.Width + FinalNorm.Length;
             foreach (var b in Layers)
-                n += b.NormIn.Length + b.QProj.Length + b.KProj.Length + b.VProj.Length
-                     + b.GateProj.Length + b.OutProj.Length + b.QNorm.Length + b.KNorm.Length
+                n += b.NormIn.Length + Elements(b.QProj) + Elements(b.KProj) + Elements(b.VProj)
+                     + Elements(b.GateProj) + Elements(b.OutProj) + b.QNorm.Length + b.KNorm.Length
                      + b.PostAttnNorm.Length + 1 + b.PreHadaNorm.Length
                      + b.D1.Length + b.D2.Length + b.D3.Length;
             foreach (var m in Mhc)
-                n += m.PhiPre.Length + m.PhiPost.Length + m.PhiRes.Length
+                n += Elements(m.PhiPre) + Elements(m.PhiPost) + Elements(m.PhiRes)
                      + m.BPre.Length + m.BPost.Length + m.BRes.Length + 3;
             foreach (var e in Engrams)
-                n += e.Tables.Length + e.KeyProj.Length + e.ValueProj.Length + e.Taps.Length;
+                n += (long)e.Tables.Tables * e.Tables.Slots * e.Tables.SubDim
+                     + Elements(e.KeyProj) + Elements(e.ValueProj) + e.Taps.Length;
             return n;
         }
     }
+
+    /// <summary>
+    /// Bytes the weights actually occupy — float32 when dense, packed codes plus
+    /// per-group norms when quantised.  This, not the parameter count, is what
+    /// decode throughput tracks.
+    /// </summary>
+    public long ByteSize
+    {
+        get
+        {
+            long bytes = Embedding.ByteSize;
+            foreach (var b in Layers)
+                bytes += b.QProj.ByteSize + b.KProj.ByteSize + b.VProj.ByteSize
+                         + b.GateProj.ByteSize + b.OutProj.ByteSize;
+            foreach (var m in Mhc)
+                bytes += m.PhiPre.ByteSize + m.PhiPost.ByteSize + m.PhiRes.ByteSize;
+            foreach (var e in Engrams)
+                bytes += e.Tables.ByteSize + e.KeyProj.ByteSize + e.ValueProj.ByteSize;
+            return bytes;
+        }
+    }
+
+    /// <summary>True when the weights are held in their packed Cactus-Quant form.</summary>
+    public bool IsQuantized => Embedding is QuantizedEmbedding;
+
+    private static long Elements(LinearWeight weight) =>
+        (long)weight.InputWidth * weight.OutputWidth;
 }
