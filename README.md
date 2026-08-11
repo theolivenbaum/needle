@@ -91,6 +91,9 @@ needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [-
 needle run        --weights <dir|file|.cact> --tokens 2,100,200 [--max-new 32]
 needle info       --weights <dir|file|.cact> [--dense]
 needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
+needle finetune   --weights <file.cact> --data <file.jsonl> --out <adapter.safetensors>
+                  [--epochs 3] [--lr 1e-4] [--rank 16] [--alpha 32] [--max-len 128]
+                  [--batch-size 4] [--eval]
 needle parity     --fixtures <dir> [--tolerance 0.01] [--verbose]
 needle cact-check --cact <file> --expected <dir> [--tolerance 1e-4] [--verbose]
 ```
@@ -138,9 +141,8 @@ Everything left is float32 rounding: the reference runs the same arithmetic in a
 different order.
 
 Fixtures are generated rather than committed (the float32 checkpoint alone is
-180 MB). `dotnet test` runs 114 tests; the five that replay fixtures skip
-cleanly when they are absent, and pick them up from `fixtures/` or
-`$NEEDLE_FIXTURES`.
+180 MB). `dotnet test` runs 135 tests; the six that need fixtures skip cleanly
+when they are absent, and pick them up from `fixtures/` or `$NEEDLE_FIXTURES`.
 
 ## Layout
 
@@ -150,6 +152,7 @@ src/Needle/Model/         the model: attention, engram, MHC stack, heads
 src/Needle/Weights/       .cact reader, Cactus-Quant, safetensors, config
 src/Needle/Tokenizer/     SentencePiece BPE from the blob, chat template
 src/Needle/Inference/     KV-cached session, agent API, constrained decoding
+src/Needle/Training/      autodiff tape, tape-based model, LoRA, AdamW, the loop
 src/Needle/Diagnostics/   the parity harnesses
 scripts/parity/           the Python side of those harnesses
 .reference/               upstream, vendored verbatim
@@ -196,6 +199,66 @@ window each step, and the logits row and attention plan are reused across steps.
 
 Numbers above were measured after a warm-up pass over the real shapes — tiered
 JIT needs it, and timing a cold run measures the interpreter.
+
+## Training
+
+LoRA fine-tuning runs here too, on the same JSONL format the reference's
+`finetune.py` consumes: `{"query", "tools", "answers", "reasoning"}` per line.
+
+```sh
+needle finetune --weights needle2.cact --data train.jsonl --out lora.safetensors \
+                --epochs 3 --rank 8 --lr 1e-3 --batch-size 4
+```
+
+```
+4 training examples; LoRA rank 8 on 135 projections (1.00M trainable of 43.4M)
+warmed the training path in 12.0s
+training-set loss before: 1.9585
+  epoch 1 step 1: loss 1.9585, grad norm 0.419, lr 0.001, 6.1s
+  epoch 10 step 10: loss 1.1734, grad norm 0.307, lr 0.000127, 7.9s
+training-set loss after:  1.1614
+```
+
+Only the five attention projections adapt, matching the reference's
+`LORA_TARGETS`; norms, the Hadamard diagonals, the engram tables and the
+hyper-connection routing stay frozen. `B` starts at zero, so step zero *is* the
+base model, and `LoraSet.Merge` folds `W + (alpha/rank)·A·B` back into an
+ordinary weight set when you are done.
+
+**Training is a separate execution flow.** Inference runs allocation-free over a
+pooled arena and records nothing; making it carry a tape would slow down the path
+that matters. So `Training/` re-expresses the same arithmetic through a
+reverse-mode autodiff tape — two implementations of one model, each shaped for
+what it has to do. That is a place for them to drift apart, so the agreement is
+asserted rather than assumed:
+
+| Check | How |
+|---|---|
+| The two forwards agree | `TrainingCheck.ForwardMatchesInference` — same tokens, no adapters, < 1e-4 relative |
+| Every hand-written backward | central finite differences, per op: Sigmoid, SiLU, RmsUnit, Walsh, Softmax, Sinkhorn, ZcRmsNorm, MatMul, CrossEntropy |
+| The whole model's gradient | `TrainingCheck.CheckGradients`, probing the largest-gradient adapter coordinates |
+| The optimiser descends what it reports | fine-tune on the released weights, evaluate a fixed set before and after |
+
+A gradient check has a subtlety worth naming: a central difference divides by
+`2·epsilon`, so a loss carrying float32 rounding of about `|loss|·2⁻²³` cannot
+resolve anything below `|loss|·2⁻²³/epsilon`. `GradientProbe` carries that noise
+floor explicitly and the check asserts at least one probe sits well above it, so
+it can neither fail on rounding nor pass vacuously.
+
+Costs, for 128-token examples on the 45M model: a step is a few seconds per
+example on four cores, and the peak working set is ~2.8 GB — about 1 GB of live
+tape (every intermediate is retained for the backward pass) plus segments the
+collector has not returned yet. `DOTNET_GCConserveMemory=9` holds it near 1 GB
+with no measurable slowdown. Training also expands the packed weights to float32,
+since it multiplies by them from both sides.
+
+The run warms the whole training path — forward, backward, clip, optimiser step —
+before the first timed step, using a scratch optimiser at learning rate zero so
+every parameter comes back bit-identical. Without it step one reports 10.4s
+against a 6.1s steady state, which is a JIT measurement, not a step.
+
+Not implemented: full fine-tuning (only LoRA), and the reference's
+OpenRouter-backed synthetic data generation.
 
 ## Relationship to upstream
 

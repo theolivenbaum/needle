@@ -379,6 +379,106 @@ public sealed class Needle2Weights
     /// <summary>True when the weights are held in their packed Cactus-Quant form.</summary>
     public bool IsQuantized => Embedding is QuantizedEmbedding;
 
+    /// <summary>
+    /// Rebuild the flat, float32 parameter map keyed by Flax path — the form
+    /// <see cref="FromFlat"/> consumes.  Quantised weights are expanded, and
+    /// per-layer tensors are restacked along a leading layer axis, so a trained
+    /// adapter can be merged and the result re-loaded.
+    /// </summary>
+    public Dictionary<string, NdArray> ToDenseParameters()
+    {
+        int l = Config.NumLayers, d = Config.DModel, lanes = Config.MhcLanes;
+        var flat = new Dictionary<string, NdArray>
+        {
+            ["embedding/embedding"] = Embedding.ToDense(),
+            ["stack/final_norm/scale"] = FinalNorm,
+        };
+
+        const string P = "stack/layers/block/";
+        flat[P + "ZCRMSNorm_0/scale"] = StackRows(l, d, i => Layers[i].NormIn);
+        flat[P + "post_attn_norm/scale"] = StackRows(l, d, i => Layers[i].PostAttnNorm);
+        flat[P + "pre_hada_norm/scale"] = StackRows(l, d, i => Layers[i].PreHadaNorm);
+        flat[P + "hadamard_mlp/d1"] = StackRows(l, Layers[0].D1.Length, i => Layers[i].D1);
+        flat[P + "hadamard_mlp/d2"] = StackRows(l, Layers[0].D2.Length, i => Layers[i].D2);
+        flat[P + "hadamard_mlp/d3"] = StackRows(l, Layers[0].D3.Length, i => Layers[i].D3);
+        flat[P + "self_attn/q_norm/scale"] = StackRows(l, Layers[0].QNorm.Length, i => Layers[i].QNorm);
+        flat[P + "self_attn/k_norm/scale"] = StackRows(l, Layers[0].KNorm.Length, i => Layers[i].KNorm);
+
+        var gates = new NdArray(l);
+        for (int i = 0; i < l; i++) gates[i] = Layers[i].AttnGate;
+        flat[P + "attn_gate"] = gates;
+
+        flat[P + "self_attn/q_proj/kernel"] = StackKernels(l, i => Layers[i].QProj);
+        flat[P + "self_attn/k_proj/kernel"] = StackKernels(l, i => Layers[i].KProj);
+        flat[P + "self_attn/v_proj/kernel"] = StackKernels(l, i => Layers[i].VProj);
+        flat[P + "self_attn/gate_proj/kernel"] = StackKernels(l, i => Layers[i].GateProj);
+        flat[P + "self_attn/out_proj/kernel"] = StackKernels(l, i => Layers[i].OutProj);
+
+        flat["stack/mhc_phi_pre"] = StackKernels(l, i => Mhc[i].PhiPre);
+        flat["stack/mhc_phi_post"] = StackKernels(l, i => Mhc[i].PhiPost);
+        flat["stack/mhc_phi_res"] = StackKernels(l, i => Mhc[i].PhiRes);
+        flat["stack/mhc_b_pre"] = StackRows(l, lanes, i => Mhc[i].BPre);
+        flat["stack/mhc_b_post"] = StackRows(l, lanes, i => Mhc[i].BPost);
+        flat["stack/mhc_b_res"] = StackRows(l, lanes * lanes, i => Mhc[i].BRes).Reshape(l, lanes, lanes);
+
+        var aPre = new NdArray(l);
+        var aPost = new NdArray(l);
+        var aRes = new NdArray(l);
+        for (int i = 0; i < l; i++)
+        {
+            aPre[i] = Mhc[i].APre;
+            aPost[i] = Mhc[i].APost;
+            aRes[i] = Mhc[i].ARes;
+        }
+        flat["stack/mhc_a_pre"] = aPre;
+        flat["stack/mhc_a_post"] = aPost;
+        flat["stack/mhc_a_res"] = aRes;
+
+        for (int s = 0; s < Engrams.Length; s++)
+        {
+            flat[$"engrams_{s}/embedding"] = Engrams[s].Tables.ToDense();
+            flat[$"engrams_{s}/key_proj/kernel"] = Engrams[s].KeyProj.ToDenseKernel();
+            flat[$"engrams_{s}/value_proj/kernel"] = Engrams[s].ValueProj.ToDenseKernel();
+            flat[$"engrams_{s}/taps"] = Engrams[s].Taps;
+        }
+
+        if (Contrastive is not null)
+        {
+            flat["contrastive_head/probes"] = Contrastive.Probes;
+            flat["contrastive_head/proj/kernel"] = Contrastive.Proj.ToDenseKernel();
+            var temperature = new NdArray(1);
+            temperature[0] = Contrastive.LogTemp;
+            flat["contrastive_head/log_temp"] = temperature;
+        }
+        if (Confidence is not null)
+        {
+            flat["confidence_head/probes"] = Confidence.Probes;
+            flat["confidence_head/proj/kernel"] = Confidence.Proj.ToDenseKernel();
+            var bias = new NdArray(1);
+            bias[0] = Confidence.Bias;
+            flat["confidence_head/proj/bias"] = bias;
+        }
+
+        return flat;
+    }
+
+    private static NdArray StackRows(int layers, int width, Func<int, NdArray> select)
+    {
+        var stacked = new NdArray(layers, width);
+        for (int i = 0; i < layers; i++) select(i).ReadSpan.CopyTo(stacked.Row(i));
+        return stacked;
+    }
+
+    private static NdArray StackKernels(int layers, Func<int, LinearWeight> select)
+    {
+        var first = select(0).ToDenseKernel();
+        var stacked = new NdArray(layers, first.Shape[0], first.Shape[1]);
+        first.ReadSpan.CopyTo(stacked.Span);
+        for (int i = 1; i < layers; i++)
+            select(i).ToDenseKernel().ReadSpan.CopyTo(stacked.Span[(i * first.Length)..]);
+        return stacked;
+    }
+
     private static long Elements(LinearWeight weight) =>
         (long)weight.InputWidth * weight.OutputWidth;
 }

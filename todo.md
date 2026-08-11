@@ -24,9 +24,10 @@ previous port was rewritten rather than extended: no TorchSharp, no
 | `model/quantize.py` — inference on packed weights | `Weights/QuantizedMatrix.cs`, `Weights/CactWeights.cs`, `Model/WeightViews.cs` | identical token streams to the float32 path |
 | n/a — safetensors interchange | `Weights/Safetensors.cs` | round-trips the reference dumps |
 | grammar-constrained decoding (upstream moved this into its compiled engine) | `Inference/ConstrainedDecoding.cs`, wired into `NeedleAgent` | unit tests; observed to correct an out-of-schema argument on a real call |
+| `model/finetune.py` — `init_lora`, `LORA_TARGETS`, the AdamW + warmup-cosine loop | `Training/Autodiff/`, `Training/TrainableModel.cs`, `Training/LoraAdapter.cs`, `Training/AdamW.cs`, `Training/Finetuner.cs` | forward parity against the inference model, finite-difference gradient checks, a fine-tune on the released weights |
 
-`dotnet test` → 114 tests. Five replay the reference fixtures and skip cleanly
-when they are absent.
+`dotnet test` → 135 tests. Six need the reference fixtures and skip cleanly when
+they are absent.
 
 ## Parity results
 
@@ -71,11 +72,13 @@ Inference-side gaps, in rough order of usefulness:
 - **Tool retrieval is not automatic.** `NeedleAgent.RetrieveTools` exposes the
   contrastive head, but the agent does not yet drop to the top five tools and
   rebuild the grammar when more than five are declared.
-- **Training.** No optimiser, no LoRA, no fine-tuning loop. The data path
-  (`Training/JsonlDataset.cs`) renders and tokenizes examples with the loss mask,
-  which is the input side; the gradient side would need a full autodiff layer
-  that this dependency-free design does not have. Fine-tune with the Python
-  package and load the resulting `.cact` here.
+- **Full fine-tuning.** Only LoRA on the five attention projections trains; the
+  autodiff layer under it is general, but nothing else is registered as a
+  parameter and the tape would have to retain the base activations to make it
+  worthwhile.
+- **Adapters do not export to `.cact`.** `LoraSet.Merge` folds them back into a
+  float32 weight set, which safetensors can carry, but writing a `.cact` needs
+  the codebook generation described above.
 
 ## Intentionally out of scope
 
@@ -83,6 +86,6 @@ Python-ecosystem infrastructure with no .NET counterpart:
 
 - `agent/fetch.py` — downloads the compiled inference engine
 - `playground/server.py` — the browser playground
-- `model/finetune.py` — OpenRouter-backed synthetic data generation and the
-  LoRA training loop
+- `model/finetune.py` — the OpenRouter-backed synthetic data generation, which
+  is an API client rather than model code (the training loop itself is ported)
 - `cli.py` — the `needle` Python CLI (this repo has its own)

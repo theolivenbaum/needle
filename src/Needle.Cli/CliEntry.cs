@@ -6,6 +6,7 @@ using Needle.Inference;
 using Needle.Math;
 using Needle.Model;
 using Needle.Tokenizer;
+using Needle.Training;
 using Needle.Weights;
 
 namespace Needle.Cli;
@@ -25,6 +26,9 @@ public static class CliEntry
           needle run        --weights <dir|file|.cact> [--config <path>] --tokens 2,100 [--max-new 32] [--dense]
           needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
           needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
+          needle finetune   --weights <file.cact> --data <file.jsonl> --out <adapter.safetensors>
+                            [--epochs 3] [--lr 1e-4] [--rank 16] [--alpha 32] [--max-len 128]
+                            [--batch-size 4] [--eval]
 
         Commands:
           parity      Compare this implementation against the JAX reference, stage
@@ -37,6 +41,8 @@ public static class CliEntry
           run         Greedy-decode from raw token IDs with the KV-cached session.
           bench       Time prefill and decode separately, and report weight
                       storage, scratch high-water and bytes allocated per token.
+          finetune    LoRA fine-tune on a JSONL dataset. The base stays frozen;
+                      only the adapters train, and they merge back at export.
 
         Weights may be a .cact blob, a directory holding weights.safetensors +
         config.json, or a .safetensors file (pass --config alongside it).
@@ -64,6 +70,7 @@ public static class CliEntry
                 "run" => RunGenerate(rest),
                 "call" => RunCall(rest),
                 "bench" => RunBench(rest),
+                "finetune" => RunFinetune(rest),
                 _ => Unknown(args[0]),
             };
         }
@@ -344,6 +351,85 @@ public static class CliEntry
         Console.WriteLine($"decode           {decodeSteps} tokens in {decode.Elapsed.TotalMilliseconds:F0} ms "
                           + $"({decodeSteps * 1000.0 / decode.Elapsed.TotalMilliseconds:F1} tok/s), "
                           + $"{decodeBytes / (double)decodeSteps / 1024.0:F1} KB allocated per token");
+        return 0;
+    }
+
+    // ── finetune ─────────────────────────────────────────────────────────────
+
+    private static int RunFinetune(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        string weightsPath = options.GetRequired("weights");
+        string dataPath = options.GetRequired("data");
+        string outPath = options.Get("out", "needle_lora.safetensors");
+
+        var config = new FinetuneConfig(
+            Epochs: int.Parse(options.Get("epochs", "3")),
+            LearningRate: float.Parse(options.Get("lr", "1e-4")),
+            Rank: int.Parse(options.Get("rank", "16")),
+            Alpha: float.Parse(options.Get("alpha", "32")),
+            MaxLength: int.Parse(options.Get("max-len", "128")),
+            BatchSize: int.Parse(options.Get("batch-size", "4")),
+            Window: int.Parse(options.Get("window", "0")),
+            Seed: int.Parse(options.Get("seed", "0")));
+
+        // Training multiplies by the base weights from both sides, so it wants
+        // them expanded regardless of how the blob is stored.
+        var loaded = CactLayout.Load(weightsPath);
+        var weights = Needle2Weights.FromFlat(loaded.Config, loaded.Parameters);
+        var tokenizer = CactTokenizer.FromCact(weightsPath);
+
+        var examples = JsonlDataset.Load(dataPath);
+        if (examples.Count == 0)
+        {
+            Console.Error.WriteLine($"No usable examples in '{dataPath}'.");
+            return 1;
+        }
+
+        var (train, validation, _) = options.GetFlag("eval")
+            ? JsonlDataset.PerToolSplit(examples)
+            : (examples, [], []);
+
+        var finetuner = new Finetuner(weights, tokenizer, config);
+        Console.WriteLine($"{train.Count} training examples"
+                          + (validation.Count > 0 ? $", {validation.Count} held out" : "")
+                          + $"; LoRA rank {config.Rank} on {finetuner.Adapters.Adapters.Count} projections "
+                          + $"({finetuner.Adapters.ParameterCount / 1e6:F2}M trainable of "
+                          + $"{weights.ParameterCount / 1e6:F1}M)");
+
+        // Per-step times are reported below, so the training path has to be at
+        // tier 1 before the first one — otherwise step 1 is a JIT measurement.
+        var warmupClock = Stopwatch.StartNew();
+        finetuner.Warmup(train);
+        Console.WriteLine($"warmed the training path in {warmupClock.Elapsed.TotalSeconds:F1}s");
+
+        // Per-step losses are different examples, so they say little on their own.
+        // Measure a fixed set before and after instead.
+        var probe = validation.Count > 0 ? validation : train;
+        string probeName = validation.Count > 0 ? "held-out" : "training-set";
+        Console.WriteLine($"{probeName} loss before: {finetuner.Evaluate(probe):F4}");
+
+        var history = finetuner.Run(train, step =>
+        {
+            if (step.Step == 1 || step.Step % 5 == 0)
+                Console.WriteLine($"  epoch {step.Epoch} step {step.Step}: loss {step.Loss:F4}, "
+                                  + $"grad norm {step.GradientNorm:F3}, lr {step.LearningRate:G3}, "
+                                  + $"{step.Elapsed.TotalSeconds:F1}s");
+        });
+
+        if (history.Count > 0)
+            Console.WriteLine($"loss {history[0].Loss:F4} -> {history[^1].Loss:F4} "
+                              + $"over {history.Count} steps");
+        Console.WriteLine($"{probeName} loss after:  {finetuner.Evaluate(probe):F4}");
+
+        // The tape retains every intermediate for the backward pass, so training
+        // is the one flow whose footprint scales with sequence length. Report it
+        // rather than leave it to be discovered.
+        using (var self = System.Diagnostics.Process.GetCurrentProcess())
+            Console.WriteLine($"peak working set: {self.PeakWorkingSet64 / 1e6:F0} MB");
+
+        finetuner.Adapters.Save(outPath);
+        Console.WriteLine($"wrote {outPath}");
         return 0;
     }
 
