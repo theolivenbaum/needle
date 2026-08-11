@@ -1,100 +1,100 @@
-using TorchSharp;
-using static TorchSharp.torch;
+using Needle.Math;
 
 namespace Needle.Model;
 
 /// <summary>
-/// Rotary Position Embeddings (RoPE).
-/// Port of <c>precompute_rope_freqs</c> and <c>apply_rope</c> from architecture.py.
+/// Rotary position embeddings.
+/// Port of <c>precompute_rope_freqs</c> and <c>apply_rope</c> in architecture.py.
+///
+/// The rotation pairs element <c>i</c> with element <c>i + headDim/2</c> (the
+/// "split-half" convention), not adjacent elements.
 /// </summary>
-public static class RoPE
+public sealed class RoPE
 {
-    /// <summary>
-    /// Precompute cosine and sine frequency tables for RoPE.
-    /// </summary>
-    /// <param name="headDim">
-    ///   Dimension of each attention head. Must be even.
-    /// </param>
-    /// <param name="seqLen">
-    ///   Maximum sequence length to precompute.
-    /// </param>
-    /// <param name="theta">
-    ///   Base frequency (default 10000.0).
-    /// </param>
-    /// <returns>
-    ///   A tuple (cos, sin) where each tensor has shape [seqLen, headDim/2]
-    ///   and dtype float32.
-    /// </returns>
-    public static (Tensor cos, Tensor sin) PrecomputeFreqs(
-        int headDim,
-        int seqLen,
-        float theta = 10000.0f)
+    private readonly float[] _cos;    // [maxLen, headDim/2]
+    private readonly float[] _sin;
+
+    /// <summary>Per-head width the tables were built for.</summary>
+    public int HeadDim { get; }
+
+    /// <summary>Number of tabulated positions.</summary>
+    public int MaxLen { get; }
+
+    /// <param name="headDim">Per-head width; must be even.</param>
+    /// <param name="maxLen">Number of positions to tabulate.</param>
+    /// <param name="theta">Base frequency (Needle 2 uses 100 000).</param>
+    public RoPE(int headDim, int maxLen, float theta = 100000f)
     {
-        // freqs = 1 / (theta ^ (arange(0, head_dim, 2) / head_dim))
-        // shape: [headDim/2]
-        using var halfRange = torch.arange(
-            start: 0,
-            stop: headDim,
-            step: 2,
-            dtype: torch.float32); // [headDim/2]
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be positive and even, got {headDim}.", nameof(headDim));
 
-        using var exponents = halfRange / headDim;          // [headDim/2]
-        using var thetaTensor = torch.tensor(theta);
-        using var freqs = torch.pow(thetaTensor, exponents); // [headDim/2]
-        using var invFreqs = 1.0f / freqs;                   // [headDim/2]
+        HeadDim = headDim;
+        MaxLen = maxLen;
+        int half = headDim / 2;
+        _cos = new float[(long)maxLen * half <= int.MaxValue ? maxLen * half : throw new ArgumentOutOfRangeException(nameof(maxLen))];
+        _sin = new float[maxLen * half];
 
-        // t = arange(seq_len), shape [seqLen]
-        using var t = torch.arange(seqLen, dtype: torch.float32); // [seqLen]
+        for (int i = 0; i < half; i++)
+        {
+            // freqs = 1 / theta^(2i / headDim)
+            double inv = 1.0 / System.Math.Pow(theta, (2.0 * i) / headDim);
+            for (int t = 0; t < maxLen; t++)
+            {
+                double angle = t * inv;
+                _cos[t * half + i] = (float)System.Math.Cos(angle);
+                _sin[t * half + i] = (float)System.Math.Sin(angle);
+            }
+        }
+    }
 
-        // angles = outer(t, freqs) → [seqLen, headDim/2]
-        using var angles = torch.outer(t, invFreqs); // [seqLen, headDim/2]
+    /// <summary>Cosine row for absolute position <paramref name="position"/>.</summary>
+    public ReadOnlySpan<float> Cos(int position) => _cos.AsSpan(position * (HeadDim / 2), HeadDim / 2);
 
-        var cos = torch.cos(angles); // [seqLen, headDim/2]
-        var sin = torch.sin(angles); // [seqLen, headDim/2]
+    /// <summary>Sine row for absolute position <paramref name="position"/>.</summary>
+    public ReadOnlySpan<float> Sin(int position) => _sin.AsSpan(position * (HeadDim / 2), HeadDim / 2);
 
-        return (cos, sin);
+    /// <summary>
+    /// Rotate one head vector in place at absolute position
+    /// <paramref name="position"/>.
+    /// </summary>
+    /// <param name="head">A single head's slice, length <see cref="HeadDim"/>.</param>
+    public void Apply(Span<float> head, int position)
+    {
+        if (head.Length != HeadDim)
+            throw new ArgumentException($"Expected a {HeadDim}-wide head, got {head.Length}.", nameof(head));
+        if ((uint)position >= (uint)MaxLen)
+            throw new ArgumentOutOfRangeException(nameof(position),
+                $"RoPE table covers {MaxLen} positions.");
+
+        int half = HeadDim / 2;
+        var cos = Cos(position);
+        var sin = Sin(position);
+        for (int i = 0; i < half; i++)
+        {
+            float a = head[i], b = head[i + half];
+            float c = cos[i], s = sin[i];
+            head[i] = a * c - b * s;
+            head[i + half] = b * c + a * s;
+        }
     }
 
     /// <summary>
-    /// Apply rotary position embeddings to a query or key tensor.
+    /// Rotate every head of a <c>[tokens, heads * headDim]</c> block, where token
+    /// <c>t</c> sits at absolute position <c>startPosition + t</c>.
     /// </summary>
-    /// <param name="x">
-    ///   Input tensor of shape [batch, heads, seqLen, headDim].
-    /// </param>
-    /// <param name="cos">
-    ///   Cosine table of shape [maxSeqLen, headDim/2] (from <see cref="PrecomputeFreqs"/>).
-    /// </param>
-    /// <param name="sin">
-    ///   Sine table of shape [maxSeqLen, headDim/2] (from <see cref="PrecomputeFreqs"/>).
-    /// </param>
-    /// <returns>
-    ///   Rotated tensor of the same shape as <paramref name="x"/>.
-    /// </returns>
-    public static Tensor ApplyRope(Tensor x, Tensor cos, Tensor sin)
+    public void ApplyRows(NdArray x, int heads, int startPosition)
     {
-        long T    = x.shape[2];
-        long half = x.shape[3] / 2;
+        int width = x.LastDim;
+        if (width != heads * HeadDim)
+            throw new ArgumentException($"Expected {heads * HeadDim} columns, got {width}.", nameof(x));
 
-        // Slice cos/sin to the actual sequence length T
-        // cos/sin: [maxSeqLen, headDim/2] → [:T] → [T, headDim/2]
-        using var cosT = cos[TensorIndex.Slice(stop: T)];          // [T, headDim/2]
-        using var sinT = sin[TensorIndex.Slice(stop: T)];          // [T, headDim/2]
-
-        // Unsqueeze to [1, 1, T, headDim/2] for broadcasting with [B, H, T, headDim/2]
-        using var cosB = cosT.unsqueeze(0).unsqueeze(0);            // [1, 1, T, headDim/2]
-        using var sinB = sinT.unsqueeze(0).unsqueeze(0);            // [1, 1, T, headDim/2]
-
-        // Split x into first and second halves along the head-dim axis
-        using var x1 = x[TensorIndex.Ellipsis, TensorIndex.Slice(stop: half)];    // [B, H, T, half]
-        using var x2 = x[TensorIndex.Ellipsis, TensorIndex.Slice(start: half)];   // [B, H, T, half]
-
-        // Rotated halves:
-        //   new_x1 = x1 * cos - x2 * sin
-        //   new_x2 = x2 * cos + x1 * sin
-        using var newX1 = x1 * cosB - x2 * sinB;  // [B, H, T, half]
-        using var newX2 = x2 * cosB + x1 * sinB;  // [B, H, T, half]
-
-        // Concatenate along last dimension → [B, H, T, headDim]
-        return torch.cat([newX1, newX2], dim: -1);
+        int rows = x.Length / width;
+        var data = x.Span;
+        for (int t = 0; t < rows; t++)
+        {
+            var row = data.Slice(t * width, width);
+            for (int h = 0; h < heads; h++)
+                Apply(row.Slice(h * HeadDim, HeadDim), startPosition + t);
+        }
     }
 }

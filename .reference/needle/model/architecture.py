@@ -1,10 +1,20 @@
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.nn.initializers as jinit
 import flax.linen as nn
+
+from . import quantize as _quantize
+from .quantize import fake_quant_act
+
+
+def _aq(x, quant):
+    if quant is False:
+        return x
+    return jax.lax.cond(quant, fake_quant_act, lambda t: t, x)
 
 
 def default_init():
@@ -17,9 +27,18 @@ def residual_init(num_layers):
 
 DTYPE_MAP = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
 
+PRESETS = {
+    "needle": dict(d_model=768, num_heads=12, num_kv_heads=6, num_layers=27,
+                   engram_layers=(2, 15)),
+}
+PRESETS["base"] = dict(d_model=512, num_heads=8, num_kv_heads=4, num_layers=27,
+                       engram_layers=(2, 15))
+PRESETS["nano"] = dict(d_model=256, num_heads=4, num_kv_heads=2, num_layers=20,
+                       vocab_size=4096, engram_layers=(2, 15), engram_slots=4096,
+                       batch_size=256)
+
 
 class ZCRMSNorm(nn.Module):
-    """Zero-centred RMSNorm: scale initialized to 0, applied as (1 + γ) * x / RMS(x)."""
     epsilon: float = 1e-6
     dtype: jnp.dtype = jnp.bfloat16
 
@@ -30,38 +49,42 @@ class ZCRMSNorm(nn.Module):
         return ((1 + scale) * x / rms).astype(self.dtype)
 
 
+
 @dataclass
 class TransformerConfig:
     vocab_size: int = 8192
-    d_model: int = 128
-    num_heads: int = 4
-    num_kv_heads: int = 2
-    num_encoder_layers: int = 2
-    num_decoder_layers: int = 2
-    d_ff: int = 512
-    max_seq_len: int = 128
+    d_model: int = 512
+    attn_dim: int = 0
+    num_heads: int = 8
+    num_kv_heads: int = 4
+    num_layers: int = 12
+    max_seq_len: int = 2048
     pad_token_id: int = 0
-    rope_theta: float = 10000.0
-    dtype: str = "bfloat16"
-    activation: str = "drelu"
-    num_memory_slots: int = 64
-    dropout_rate: float = 0.1
     contrastive_dim: int = 128
-    no_feedforward: bool = True
+    rope_theta: float = 100000.0
+    dtype: str = "bfloat16"
+    flash: bool = True
+    engram_orders: tuple = (2, 3)
+    engram_heads: int = 0
+    engram_slots: int = 8192
+    engram_layers: tuple = (2, 15)
+    mhc_lanes: int = 4
+    kv_window: int = 0
+    kv_bits: int = 8
+    act_bits: int = 8
+    weight_bits: str = ""
 
     def __init__(self, **kwargs):
         valid = {f.name for f in self.__dataclass_fields__.values()}
         for k, v in kwargs.items():
             if k in valid:
                 setattr(self, k, v)
+        self.attn_dim = self.attn_dim or self.d_model
+        self.engram_layers = tuple(self.engram_layers)
 
     @property
     def jax_dtype(self):
         return DTYPE_MAP[self.dtype]
-
-    @property
-    def total_layers(self):
-        return self.num_encoder_layers + self.num_decoder_layers
 
 
 def precompute_rope_freqs(head_dim, seq_len, theta=10000.0):
@@ -78,7 +101,102 @@ def apply_rope(x, cos, sin):
     sin = sin[:T][None, None, :, :]
     x1 = x[..., :half]
     x2 = x[..., half:]
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(x.dtype)
+
+
+ENGRAM_SUB_DIM = 128
+ENGRAM_CONV_TAPS = 4
+_ENGRAM_SEED = 0x9E3779B9
+_ENGRAM_PRIME = 0x01000193
+
+
+def engram_geometry(config):
+    orders = tuple(config.engram_orders)
+    heads = config.engram_heads or max(1, config.d_model // (len(orders) * ENGRAM_SUB_DIM))
+    sub_dim = config.d_model // (len(orders) * heads)
+    return orders, heads, sub_dim
+
+
+def _shift_right(x, offset):
+    if offset == 0:
+        return x
+    pad = [(0, 0)] * x.ndim
+    pad[1] = (offset, 0)
+    return jnp.pad(x, pad)[:, : x.shape[1]]
+
+
+def _mask_diag(mask, offset):
+    m = mask[:, 0]
+    T = m.shape[-1]
+    if offset >= T:
+        return jnp.zeros(m.shape[:-2] + (T,), m.dtype)
+    d = jnp.diagonal(m, offset=-offset, axis1=-2, axis2=-1)
+    if offset == 0:
+        return d
+    return jnp.pad(d, ((0, 0), (offset, 0)))
+
+
+def engram_indices(tokens, orders, heads, slots):
+    u = tokens.astype(jnp.uint32)
+    idx = []
+    for oi, order in enumerate(orders):
+        for h in range(heads):
+            seed = (_ENGRAM_SEED * (oi * heads + h + 1)) & 0xFFFFFFFF
+            acc = jnp.full_like(u, jnp.uint32(seed))
+            for j in range(order):
+                acc = (acc ^ _shift_right(u, j)) * jnp.uint32(_ENGRAM_PRIME)
+            acc = acc ^ (acc >> jnp.uint32(15))
+            idx.append((acc % jnp.uint32(slots)).astype(jnp.int32))
+    return jnp.stack(idx, axis=-1)
+
+
+def _rms_unit(x, epsilon=1e-6):
+    xf = x.astype(jnp.float32)
+    return xf * jax.lax.rsqrt(jnp.mean(xf ** 2, axis=-1, keepdims=True) + epsilon)
+
+
+def _conv_identity_init(key, shape, dtype=jnp.float32):
+    return jnp.zeros(shape, dtype).at[0].set(1.0)
+
+
+def _sinkhorn(logits, iters=20):
+    log_K = logits
+    for _ in range(iters):
+        log_K = log_K - jax.nn.logsumexp(log_K, axis=-1, keepdims=True)
+        log_K = log_K - jax.nn.logsumexp(log_K, axis=-2, keepdims=True)
+    return jnp.exp(log_K)
+
+
+def _res_identity_init(key, shape, dtype=jnp.float32):
+    return jnp.broadcast_to(4.0 * jnp.eye(shape[-1], dtype=dtype), shape)
+
+
+class Engram(nn.Module):
+    d_model: int
+    num_tables: int
+    slots: int
+    sub_dim: int
+    num_layers: int
+    conv_dilation: int
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, indices, ngram_ok, tap_ok, quant=False):
+        tables = self.param("embedding", default_init(),
+                            (self.num_tables, self.slots, self.sub_dim))
+        fetched = tables[jnp.arange(self.num_tables), indices]
+        fetched = fetched * ngram_ok[..., None]
+        e = fetched.reshape(*indices.shape[:2], self.num_tables * self.sub_dim)
+        e = _aq(e.astype(self.dtype), quant)
+        k = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                     kernel_init=default_init(), name="key_proj")(e)
+        v = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                     kernel_init=residual_init(self.num_layers), name="value_proj")(e)
+        taps = self.param("taps", _conv_identity_init,
+                          (ENGRAM_CONV_TAPS, self.d_model)).astype(self.dtype)
+        v = sum(taps[j] * _shift_right(v, j * self.conv_dilation) * tap_ok[j][..., None]
+                for j in range(ENGRAM_CONV_TAPS))
+        return k, v
 
 
 class MultiHeadAttention(nn.Module):
@@ -87,17 +205,20 @@ class MultiHeadAttention(nn.Module):
     d_model: int
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
-    rope_keys_only: bool = False
+    flash: bool = True
+    attn_dim: int = 0
 
     @nn.compact
-    def __call__(self, q_input, kv_input, mask=None, rope=None):
-        head_dim = self.d_model // self.num_heads
+    def __call__(self, x, mask=None, rope=None, quant=False):
+        attn_dim = self.attn_dim or self.d_model
+        head_dim = attn_dim // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
-        B = q_input.shape[0]
+        B = x.shape[0]
 
-        q = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="q_proj")(q_input)
-        k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
-        v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
+        x = _aq(x, quant)
+        q = nn.Dense(attn_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="q_proj")(x)
+        k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(x)
+        v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(x)
 
         q = q.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
@@ -106,350 +227,354 @@ class MultiHeadAttention(nn.Module):
         q = ZCRMSNorm(dtype=self.dtype, name="q_norm")(q)
         k = ZCRMSNorm(dtype=self.dtype, name="k_norm")(k)
 
-        repeats = self.num_heads // self.num_kv_heads
-        if repeats > 1:
-            k = jnp.repeat(k, repeats, axis=1)
-            v = jnp.repeat(v, repeats, axis=1)
-
         if rope is not None:
             cos, sin = rope
-            if not self.rope_keys_only:
-                q = apply_rope(q, cos, sin)
+            q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
 
-        scale = jnp.sqrt(jnp.float32(head_dim))
-        attn_weights = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
+        k = _quantize.maybe_quant_kv(k, quant)
+        v = _quantize.maybe_quant_kv(v, quant)
 
-        if mask is not None:
-            attn_weights = jnp.where(mask, attn_weights, jnp.finfo(attn_weights.dtype).min)
+        if self.flash:
+            impl = ("cudnn" if jax.default_backend() == "gpu"
+                    and q.dtype in (jnp.bfloat16, jnp.float16) else None)
+            out = jax.nn.dot_product_attention(
+                q.transpose(0, 2, 1, 3),
+                k.transpose(0, 2, 1, 3),
+                v.transpose(0, 2, 1, 3),
+                mask=mask,
+                implementation=impl,
+            )
+            out = out.reshape(B, -1, attn_dim)
+        else:
+            repeats = self.num_heads // self.num_kv_heads
+            if repeats > 1:
+                k = jnp.repeat(k, repeats, axis=1)
+                v = jnp.repeat(v, repeats, axis=1)
 
-        attn_weights = nn.softmax(attn_weights, axis=-1)
+            scale = jnp.sqrt(jnp.float32(head_dim))
+            attn_weights = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
 
-        out = jnp.matmul(attn_weights, v)
-        out = out.transpose(0, 2, 1, 3).reshape(B, -1, self.d_model)
+            if mask is not None:
+                attn_weights = jnp.where(mask, attn_weights, jnp.finfo(attn_weights.dtype).min)
+
+            attn_weights = nn.softmax(attn_weights, axis=-1)
+
+            out = jnp.matmul(attn_weights, v)
+            out = out.transpose(0, 2, 1, 3).reshape(B, -1, attn_dim)
+
+        out = out * nn.sigmoid(
+            nn.Dense(attn_dim, dtype=self.dtype, use_bias=False,
+                     kernel_init=default_init(), name="gate_proj")(x))
+        out = _aq(out, quant)
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="out_proj")(out)
 
 
-class FeedForward(nn.Module):
+def _walsh_matrix(n):
+    H = np.array([[1.0]], dtype=np.float32)
+    while H.shape[0] < n:
+        H = np.block([[H, H], [H, -H]])
+    return jnp.asarray(H / np.sqrt(n))
+
+
+class HadamardMLP(nn.Module):
     d_model: int
-    d_ff: int
-    num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
-    activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, ffn_mask=None):
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
-        if self.activation == "swiglu":
-            h = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            h = nn.gelu(gate) * up
-        else:  # drelu
-            h = nn.relu(gate) * nn.relu(up)
-        if ffn_mask is not None:
-            h = h * ffn_mask[:, None, :] 
-        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(h)
+    def __call__(self, x):
+        n = 1 << (self.d_model - 1).bit_length()
+        H = _walsh_matrix(n).astype(self.dtype)
+        d1 = self.param("d1", jinit.ones, (n,)).astype(self.dtype)
+        d2 = self.param("d2", jinit.ones, (n,)).astype(self.dtype)
+        d3 = self.param("d3", jinit.constant(0.02), (n,)).astype(self.dtype)
+        pad = n - self.d_model
+        z = jnp.pad(x, ((0, 0), (0, 0), (0, pad))) if pad else x
+        z = (d1 * z) @ H
+        z = nn.silu(d2 * z) @ H
+        return (d3 * z)[..., : self.d_model]
 
 
-class EncoderBlock(nn.Module):
-    """Pre-norm self-attention + pre-norm FFN with gated residual connections."""
+class Block(nn.Module):
     num_heads: int
     num_kv_heads: int
     d_model: int
-    d_ff: int
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
-    activation: str = "drelu"
-    dropout_rate: float = 0.0
-    no_feedforward: bool = True
+    flash: bool = True
+    attn_dim: int = 0
+
+    def _gate(self, name):
+        return nn.sigmoid(self.param(name, jinit.zeros, ())).astype(self.dtype)
 
     @nn.compact
-    def __call__(self, x, mask=None, rope=None, ffn_mask=None, deterministic=True):
-        gate = nn.sigmoid(self.param("attn_gate", jinit.zeros, ())).astype(self.dtype)
-        residual = x
+    def __call__(self, x, mask=None, rope=None, quant=False, engram_kv=None, site_flags=None):
+        if engram_kv is not None:
+            ek, ev = engram_kv
+            alpha = nn.sigmoid(jnp.einsum("btd,sbtd->sbt", _rms_unit(x), _rms_unit(ek))
+                               / math.sqrt(self.d_model))
+            x = x + jnp.einsum("s,sbt,sbtd->btd", site_flags.astype(jnp.float32),
+                               alpha, ev.astype(jnp.float32)).astype(x.dtype)
+
+        skip = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=mask, rope=rope
-        )
-        x = residual + gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers,
+                               self.dtype, self.flash, attn_dim=self.attn_dim,
+                               name="self_attn")(x, mask=mask, rope=rope, quant=quant)
+        x = ZCRMSNorm(dtype=self.dtype, name="post_attn_norm")(x)
+        x = skip + self._gate("attn_gate") * x
 
-        if not self.no_feedforward:
-            ffn_gate = nn.sigmoid(self.param("ffn_gate", jinit.zeros, ())).astype(self.dtype)
-            residual = x
-            x = ZCRMSNorm(dtype=self.dtype)(x)
-            x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
-            x = residual + ffn_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
-
-        return x
+        skip = x
+        x = ZCRMSNorm(dtype=self.dtype, name="pre_hada_norm")(x)
+        x = HadamardMLP(self.d_model, self.dtype, name="hadamard_mlp")(x)
+        return skip + x
 
 
-class _EncoderScanBody(nn.Module):
-    """Wraps EncoderBlock for nn.scan: carry = (x, mask, rope, ffn_mask)."""
+class _ScanBody(nn.Module):
     num_heads: int
     num_kv_heads: int
     d_model: int
-    d_ff: int
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
-    activation: str = "drelu"
-    dropout_rate: float = 0.0
-    no_feedforward: bool = True
-    deterministic: bool = True
+    flash: bool = True
+    collect_hidden: bool = False
+    attn_dim: int = 0
 
     @nn.compact
-    def __call__(self, carry, _):
-        x, mask, rope, ffn_mask = carry
-        x = EncoderBlock(
-            self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
-            self.num_layers, self.dtype, self.activation, self.dropout_rate,
-            self.no_feedforward,
-        )(x, mask, rope, ffn_mask, self.deterministic)
-        return (x, mask, rope, ffn_mask), None
+    def __call__(self, x, xs, mask, rope, quant, engram_kv):
+        site_flags, hc = xs
+        block = Block(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers,
+            self.dtype, self.flash, attn_dim=self.attn_dim,
+            name="block",
+        )
+        B, T, n, C = x.shape
+        xf = x.astype(jnp.float32)
+        nx = _rms_unit(x.reshape(B, T, n * C))
+        hpre = nn.sigmoid(hc["a_pre"] * (nx @ hc["phi_pre"].astype(jnp.float32))
+                          + hc["b_pre"] + hc["pre_off"])
+        u = jnp.einsum("btn,btnc->btc", hpre, xf).astype(self.dtype)
+        y = block(u, mask=mask, rope=rope, quant=quant,
+                  engram_kv=engram_kv, site_flags=site_flags) - u
+        hpost = 2 * nn.sigmoid(hc["a_post"] * (nx @ hc["phi_post"].astype(jnp.float32))
+                               + hc["b_post"] + hc["post_off"])
+        res = nx @ hc["phi_res"].astype(jnp.float32)
+        hres = _sinkhorn(hc["a_res"] * res.reshape(B, T, n, n) + hc["b_res"])
+        new_x = (jnp.einsum("btij,btjc->btic", hres, xf)
+                 + hpost[..., None] * y.astype(jnp.float32)[:, :, None, :]).astype(self.dtype)
+        out = jnp.mean(new_x, axis=2) if self.collect_hidden else None
+        return new_x, out
 
 
-class Encoder(nn.Module):
-    """Self-attention encoder. Returns (output, mask) tuple."""
+class Stack(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, mask=None, rope=None, ffn_mask=None, deterministic=True):
+    def __call__(self, x, mask=None, rope=None, engram_kv=None, collect_hidden=False,
+                 quant=False):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
 
-        ScanBlock = nn.scan(
-            nn.remat(_EncoderScanBody),
-            variable_axes={"params": 0},
-            split_rngs={"params": True, "dropout": True},
-            length=cfg.num_encoder_layers,
-        )
-        (x, _, _, _), _ = ScanBlock(
-            cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-            cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-            cfg.no_feedforward, deterministic, name="layers",
-        )((x, mask, rope, ffn_mask), None)
+        site_flags = None
+        if engram_kv is not None:
+            flags = np.zeros((cfg.num_layers, len(cfg.engram_layers)), np.float32)
+            for s, layer in enumerate(cfg.engram_layers):
+                flags[layer, s] = 1.0
+            site_flags = jnp.asarray(flags)
 
+        n, L, nC = cfg.mhc_lanes, cfg.num_layers, cfg.mhc_lanes * cfg.d_model
+        lane = np.eye(n, dtype=np.float32)[np.arange(L) % n]
+        hc = {
+            "phi_pre": self.param("mhc_phi_pre", default_init(), (L, nC, n)),
+            "phi_post": self.param("mhc_phi_post", default_init(), (L, nC, n)),
+            "phi_res": self.param("mhc_phi_res", default_init(), (L, nC, n * n)),
+            "b_pre": self.param("mhc_b_pre", jinit.zeros, (L, n)),
+            "b_post": self.param("mhc_b_post", jinit.zeros, (L, n)),
+            "b_res": self.param("mhc_b_res", _res_identity_init, (L, n, n)),
+            "a_pre": self.param("mhc_a_pre", jinit.constant(0.01), (L,)),
+            "a_post": self.param("mhc_a_post", jinit.constant(0.01), (L,)),
+            "a_res": self.param("mhc_a_res", jinit.constant(0.01), (L,)),
+            "pre_off": jnp.asarray(8 * lane - 4),
+            "post_off": jnp.asarray(-4 * (1 - lane)),
+        }
+        x = jnp.broadcast_to(x[:, :, None, :], (*x.shape[:2], n, x.shape[-1]))
+
+        ScanBlock = nn.scan(
+            nn.remat(_ScanBody),
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            length=cfg.num_layers,
+            in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
+        )
+        x, hidden = ScanBlock(
+            cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.num_layers, dt,
+            cfg.flash, collect_hidden, attn_dim=cfg.attn_dim,
+            name="layers",
+        )(x, (site_flags, hc), mask, rope, quant, engram_kv)
+
+        x = jnp.mean(x, axis=2)
         x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
-        return x, mask
+        return x, hidden
 
 
-class DecoderBlock(nn.Module):
-    num_heads: int
-    num_kv_heads: int
+def probe_pool(cells, probes, keep=None, dtype=jnp.bfloat16):
+    b, t, l, d = cells.shape
+    cells = cells.reshape(b, t * l, d)
+    if keep is not None:
+        keep = jnp.repeat(keep, l, axis=1)
+    scores = jnp.einsum("bcd,kd->bkc", cells.astype(jnp.float32),
+                        probes.astype(jnp.float32)) / math.sqrt(d)
+    if keep is not None:
+        scores = jnp.where(keep[:, None, :] > 0, scores, -jnp.inf)
+    w = jax.nn.softmax(scores, axis=-1)
+    return jnp.einsum("bkc,bcd->bkd", w, cells.astype(jnp.float32)
+                      ).reshape(b, -1).astype(dtype)
+
+
+class ContrastiveHead(nn.Module):
     d_model: int
-    d_ff: int
-    num_layers: int
+    out_dim: int
     dtype: jnp.dtype = jnp.bfloat16
-    activation: str = "drelu"
-    dropout_rate: float = 0.0
-    no_feedforward: bool = True
+    temp_init: float = 0.07
+
+    PROBES = 4
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
-        self_gate = nn.sigmoid(self.param("self_attn_gate", jinit.zeros, ())).astype(self.dtype)
-        residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=self_mask, rope=rope
-        )
-        x = residual + self_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
-
-        cross_gate = nn.sigmoid(self.param("cross_attn_gate", jinit.zeros, ())).astype(self.dtype)
-        residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
-            x, encoder_out, mask=cross_mask
-        )
-        x = residual + cross_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
-
-        if not self.no_feedforward:
-            ffn_gate = nn.sigmoid(self.param("ffn_gate", jinit.zeros, ())).astype(self.dtype)
-            residual = x
-            x = ZCRMSNorm(dtype=self.dtype)(x)
-            x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
-            x = residual + ffn_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
-
-        return x
+    def __call__(self, cells, keep=None):
+        pooled = probe_pool(cells, self.param("probes", default_init(),
+                                              (self.PROBES, cells.shape[-1])),
+                            keep, self.dtype)
+        p = nn.Dense(self.out_dim, dtype=self.dtype, use_bias=False,
+                     kernel_init=default_init(), name="proj")(pooled)
+        log_temp = self.param("log_temp", jinit.constant(math.log(self.temp_init)), ())
+        denom = jnp.sqrt(jnp.sum(p.astype(jnp.float32) ** 2, axis=-1, keepdims=True) + 1e-12)
+        return (p / denom.astype(p.dtype)), log_temp
 
 
-
-class _DecoderScanBody(nn.Module):
-    """Wraps DecoderBlock for nn.scan: carry = (x, encoder_out, self_mask, cross_mask, rope, ffn_mask)."""
-    num_heads: int
-    num_kv_heads: int
-    d_model: int
-    d_ff: int
-    num_layers: int
+class ConfidenceHead(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
-    activation: str = "drelu"
-    dropout_rate: float = 0.0
-    no_feedforward: bool = True
-    deterministic: bool = True
+
+    PROBES = 8
 
     @nn.compact
-    def __call__(self, carry, _):
-        x, encoder_out, self_mask, cross_mask, rope, ffn_mask = carry
-        x = DecoderBlock(
-            self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
-            self.num_layers, self.dtype, self.activation, self.dropout_rate,
-            self.no_feedforward,
-        )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, self.deterministic)
-        return (x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None
-
-
-class Decoder(nn.Module):
-    config: TransformerConfig
-
-    @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
-        cfg = self.config
-        dt = cfg.jax_dtype
-        x = x.astype(dt)
-
-        ScanBlock = nn.scan(
-            nn.remat(_DecoderScanBody),
-            variable_axes={"params": 0},
-            split_rngs={"params": True, "dropout": True},
-            length=cfg.num_decoder_layers,
-        )
-        (x, _, _, _, _, _), _ = ScanBlock(
-            cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-            cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-            cfg.no_feedforward, deterministic, name="layers",
-        )((x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None)
-
-        x = ZCRMSNorm(dtype=dt)(x)
-        return x
+    def __call__(self, cells, keep=None):
+        pooled = probe_pool(cells, self.param("probes", default_init(),
+                                              (self.PROBES, cells.shape[-1])),
+                            keep, self.dtype)
+        logit = nn.Dense(1, dtype=self.dtype, use_bias=True,
+                         kernel_init=default_init(), name="proj")(pooled)
+        return logit[..., 0].astype(jnp.float32)
 
 
 class SimpleAttentionNetwork(nn.Module):
-    """Encoder-decoder transformer with shared embeddings, tied output, RoPE, and bfloat16."""
     config: TransformerConfig
 
     def setup(self):
-        self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
-        self.embed_scale = math.sqrt(self.config.d_model)
-        self.encoder = Encoder(self.config)
-        self.decoder = Decoder(self.config)
-        self.contrastive_hidden = nn.Dense(
-            self.config.d_model // 4, dtype=self.config.jax_dtype,
-            kernel_init=default_init(), name="contrastive_hidden",
-        )
-        self.contrastive_proj = nn.Dense(
-            self.config.contrastive_dim, dtype=self.config.jax_dtype,
-            use_bias=False, kernel_init=default_init(), name="contrastive_proj",
-        )
-        self.log_temp = self.param("log_temp", jinit.zeros, ())
+        cfg = self.config
+        self.embedding = nn.Embed(cfg.vocab_size, cfg.d_model, embedding_init=jinit.normal(stddev=0.02))
+        self.embed_scale = math.sqrt(cfg.d_model)
+        self.stack = Stack(cfg)
+        self.contrastive_head = ContrastiveHead(
+            cfg.d_model, cfg.contrastive_dim, cfg.jax_dtype)
+        self.confidence_head = ConfidenceHead(cfg.jax_dtype)
+        assert all(l < cfg.num_layers for l in cfg.engram_layers)
+        orders, heads, sub_dim = engram_geometry(cfg)
+        self.engrams = [
+            Engram(cfg.d_model, len(orders) * heads, cfg.engram_slots,
+                   sub_dim, cfg.num_layers, max(orders), cfg.jax_dtype)
+            for _ in cfg.engram_layers
+        ]
+        self.mtp_combine = nn.Dense(cfg.d_model, dtype=cfg.jax_dtype, use_bias=False,
+                                    kernel_init=default_init())
+        self.mtp_block = Block(cfg.num_heads, cfg.num_kv_heads, cfg.d_model,
+                               cfg.num_layers, cfg.jax_dtype, cfg.flash,
+                               attn_dim=cfg.attn_dim)
+        self.mtp_emb_norm = ZCRMSNorm(dtype=cfg.jax_dtype)
+        self.mtp_final_norm = ZCRMSNorm(dtype=cfg.jax_dtype)
 
     def _rope(self, seq_len):
-        head_dim = self.config.d_model // self.config.num_heads
-        return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
+        cfg = self.config
+        head_dim = (cfg.attn_dim or cfg.d_model) // cfg.num_heads
+        return precompute_rope_freqs(head_dim, seq_len, cfg.rope_theta)
 
-    def encode_text(self, src, src_mask=None, ffn_mask=None, deterministic=True):
-        x = self.embedding(src) * self.embed_scale
-        rope = self._rope(src.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
+    def _engram_kv(self, tokens, mask, quant):
+        if not self.engrams:
+            return None
+        orders, heads, _ = engram_geometry(self.config)
+        indices = engram_indices(tokens, orders, heads, self.config.engram_slots)
+        ngram_ok = jnp.stack([_mask_diag(mask, o - 1) for o in orders for _ in range(heads)],
+                             axis=-1)
+        tap_ok = jnp.stack([_mask_diag(mask, j * max(orders)) for j in range(ENGRAM_CONV_TAPS)])
+        pairs = [e(indices, ngram_ok, tap_ok, quant=quant) for e in self.engrams]
+        return jnp.stack([k for k, _ in pairs]), jnp.stack([v for _, v in pairs])
 
-    def encode(self, src, src_mask=None):
-        """Backward-compatible alias for encode_text."""
-        return self.encode_text(src, src_mask=src_mask)
+    def __call__(self, tokens, mask=None, quant=False, return_mtp=False):
+        if mask is None:
+            mask = make_causal_mask(tokens.shape[1])
+        x = self.embedding(tokens) * self.embed_scale
+        rope = self._rope(tokens.shape[1])
+        engram_kv = self._engram_kv(tokens, mask, quant)
+        x, _ = self.stack(x, mask=mask, rope=rope, engram_kv=engram_kv, quant=quant)
+        logits = _aq(x, quant).astype(jnp.float32) @ self.embedding.embedding.T
+        if not (return_mtp or self.is_initializing()):
+            return logits
 
-    def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None, deterministic=True):
-        """Decode from encoder output with cross_mask for variable-length encoder output."""
-        x = self.embedding(tgt) * self.embed_scale
-        rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
-        logits = x.astype(jnp.float32) @ self.embedding.embedding.T
-        return logits
+        nxt = jnp.pad(tokens[:, 1:], ((0, 0), (0, 1)))
+        e2 = self.mtp_emb_norm(self.embedding(nxt) * self.embed_scale)
+        m = self.mtp_combine(_aq(jnp.concatenate([x, e2], axis=-1), quant))
+        m = self.mtp_block(m, mask=mask, rope=rope, quant=quant)
+        m = self.mtp_final_norm(m)
+        mtp_logits = _aq(m, quant).astype(jnp.float32) @ self.embedding.embedding.T
+        if not return_mtp:
+            return logits
+        return logits, mtp_logits
 
-    def _mean_pool(self, encoder_out, enc_mask):
-        """Mean-pool encoder output over non-padded positions. Returns (B, d_model)."""
-        if enc_mask is not None:
-            mask_2d = enc_mask[:, 0, 0, :]
-        else:
-            mask_2d = jnp.ones(encoder_out.shape[:2], dtype=encoder_out.dtype)
-        mask_3d = mask_2d[:, :, None].astype(encoder_out.dtype) 
-        summed = jnp.sum(encoder_out * mask_3d, axis=1) 
-        counts = jnp.maximum(jnp.sum(mask_2d, axis=1, keepdims=True), 1.0)
-        return summed / counts
+    def hidden_cells(self, tokens, quant=False, window=0, sink=None):
+        cfg = self.config
+        mask = (make_causal_mask(tokens.shape[1])
+                & make_padding_mask(tokens, cfg.pad_token_id))
+        if window:
+            pos = jnp.arange(tokens.shape[1])
+            recent = ((pos[:, None] - pos[None, :]) < window)[None, None, :, :]
+            keep = recent if sink is None else (recent | sink[:, None, None, :])
+            mask = mask & keep
+        x0 = self.embedding(tokens) * self.embed_scale
+        rope = self._rope(tokens.shape[1])
+        engram_kv = self._engram_kv(tokens, mask, quant)
+        _, hidden = self.stack(x0, mask=mask, rope=rope, engram_kv=engram_kv,
+                               quant=quant, collect_hidden=True)
+        return jnp.stack([x0, *hidden], axis=2)
 
-    def encode_contrastive(self, tokens, deterministic=True):
-        """Encode tokens and project to L2-normalized contrastive space. Returns (B, contrastive_dim)."""
-        src_mask = make_padding_mask(tokens, self.config.pad_token_id)
-        encoder_out, enc_mask = self.encode_text(tokens, src_mask=src_mask, deterministic=deterministic)
-        pooled = self._mean_pool(encoder_out, enc_mask)
-        h = nn.relu(self.contrastive_hidden(pooled))
-        projected = self.contrastive_proj(h)
-        # Safe L2 normalize: sqrt(sum² + eps²) has smooth gradient at origin,
-        # whereas max(norm, eps) NaNs in the backward pass when projected == 0
-        # (which happens after pretrain decays contrastive weights to ~0).
-        denom = jnp.sqrt(jnp.sum(projected.astype(jnp.float32) ** 2, axis=-1, keepdims=True) + 1e-12)
-        return (projected / denom.astype(projected.dtype))
+    def _encode_contrastive(self, tokens, quant=False, window=0, sink=None):
+        cells = jax.lax.stop_gradient(
+            self.hidden_cells(tokens, quant=quant, window=window, sink=sink))
+        keep = (tokens != self.config.pad_token_id).astype(jnp.float32)
+        return self.contrastive_head(cells, keep=keep)
 
-    def forward_contrastive(self, query_tokens, tool_tokens, deterministic=True):
-        """Encode query and tool tokens, return (q_emb, t_emb, log_temp)."""
-        q_emb = self.encode_contrastive(query_tokens, deterministic=deterministic)
-        t_emb = self.encode_contrastive(tool_tokens, deterministic=deterministic)
-        return q_emb, t_emb, self.log_temp
+    def encode_contrastive(self, tokens, quant=False, window=0, sink=None):
+        return self._encode_contrastive(tokens, quant=quant, window=window,
+                                        sink=sink)[0]
 
-    def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None):
-        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
-        cm = cross_mask if cross_mask is not None else enc_mask
-        logits = self.decode(tgt, encoder_out, self_mask=tgt_mask, cross_mask=cm)
-        return logits
+    def forward_contrastive(self, query_tokens, tool_tokens, quant=False):
+        q_emb, log_temp = self._encode_contrastive(query_tokens, quant=quant)
+        t_emb, _ = self._encode_contrastive(tool_tokens, quant=quant)
+        return q_emb, t_emb, log_temp
 
-    def _run_decoder(self, encoder_out, tgt, tgt_mask=None, cross_mask=None, ffn_mask=None, deterministic=True):
-        """Run decoder and return float32 hidden states."""
-        x = self.embedding(tgt) * self.embed_scale
-        rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=cross_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
-        return x.astype(jnp.float32)
+    def forward_confidence(self, tokens, quant=False, window=0, sink=None):
+        cells = jax.lax.stop_gradient(
+            self.hidden_cells(tokens, quant=quant, window=window, sink=sink))
+        keep = (tokens != self.config.pad_token_id).astype(jnp.float32)
+        return self.confidence_head(cells, keep=keep)
 
-    def forward_masked(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, ffn_mask=None, deterministic=True):
-        """Single forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
-        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
-        cm = cross_mask if cross_mask is not None else enc_mask
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=cm, ffn_mask=ffn_mask, deterministic=deterministic)
-        logits = x_f32 @ self.embedding.embedding.T
-        return logits, 0.0
-
-    def _make_eval_ffn_mask(self, ff_width, B, dtype):
-        """Default prefix FFN mask for eval: first ff_width neurons active."""
-        mask = (jnp.arange(self.config.d_ff) < ff_width).astype(dtype)
-        return jnp.broadcast_to(mask[None, :], (B, self.config.d_ff))
-
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mat_ff_widths=None):
-        """Eval-only: separate per-width forwards for reporting per-width PPL.
-
-        mat_ff_widths: list of FFN widths to evaluate (e.g. [1024, 512, 256]).
-        """
-        emb = self.embedding.embedding
-        B = src.shape[0]
-
-        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
-        cm = cross_mask if cross_mask is not None else enc_mask
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=cm)
-        logits = x_f32 @ emb.T
-
-        mat_logits = []
-        if mat_ff_widths is not None:
-            for ff_w in mat_ff_widths:
-                mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
-                enc_m, enc_m_mask = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
-                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, cross_mask=cm, ffn_mask=mask)
-                mat_logits.append(x_m @ emb.T)
-
-        return logits, 0.0, mat_logits
-
-    def init_all(self, src, tgt):
-        """Dummy forward through text pathway to initialize all params."""
-        src_mask = make_padding_mask(src, self.config.pad_token_id)
-        tgt_mask = make_causal_mask(tgt.shape[1]) & make_padding_mask(tgt, self.config.pad_token_id)
-        text_out, text_enc_mask = self.encode_text(src, src_mask=src_mask)
-        _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask, cross_mask=text_enc_mask)
-        _ = self.encode_contrastive(src)
-        return jnp.zeros(())
+    def hidden_states(self, tokens, mask=None):
+        if mask is None:
+            mask = make_causal_mask(tokens.shape[1])
+        x = self.embedding(tokens) * self.embed_scale
+        rope = self._rope(tokens.shape[1])
+        engram_kv = self._engram_kv(tokens, mask, False)
+        _, hidden = self.stack(x, mask=mask, rope=rope, engram_kv=engram_kv, collect_hidden=True)
+        return hidden.astype(jnp.float32)
 
 
 def make_causal_mask(seq_len):
@@ -462,38 +587,36 @@ def make_padding_mask(tokens, pad_token_id):
     return mask[:, None, None, :]
 
 
-def make_packing_mask(seg_ids):
-    """Block-diagonal self-attention mask from segment IDs.
-
-    seg_ids: (B, T) int array where 0 = padding, 1+ = segment number.
-    Returns: (B, 1, T, T) bool mask — True where attention is allowed.
-    Tokens attend to each other only if they share the same non-zero segment ID.
-    """
-    # (B, T, 1) == (B, 1, T) -> (B, T, T)
-    mask = (seg_ids[:, :, None] == seg_ids[:, None, :]) & (seg_ids[:, :, None] > 0)
-    return mask[:, None, :, :]
+KV_BUDGET_BYTES = 11 * 1024 * 1024 + 512 * 1024
+KV_GROUP = 32
+KV_WINDOW_MIN = 160
 
 
-def make_causal_packing_mask(seg_ids):
-    """Block-diagonal causal mask from segment IDs.
+def kv_budget_window(config):
+    head_dim = (getattr(config, "attn_dim", 0) or config.d_model) // config.num_heads
+    kv = config.num_kv_heads * head_dim
+    d, L = config.d_model, config.num_layers
+    sites = len(tuple(getattr(config, "engram_layers", (2, 15))))
+    per_pos = (L * (2 * kv + 2 * (kv // KV_GROUP) * 4)
+               + sites * (d + (d // KV_GROUP) * 4))
+    window = (KV_BUDGET_BYTES // per_pos) // KV_GROUP * KV_GROUP
+    return max(KV_WINDOW_MIN, min(window, config.max_seq_len))
 
-    Same as make_packing_mask but also enforces causal ordering within each segment.
-    Returns: (B, 1, T, T) bool mask.
-    """
+
+def effective_kv_window(config):
+    budget = kv_budget_window(config)
+    return min(budget, config.kv_window) if config.kv_window else budget
+
+
+def make_causal_packing_mask(seg_ids, prefix=None, window=0):
     T = seg_ids.shape[1]
     causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
     block = (seg_ids[:, :, None] == seg_ids[:, None, :]) & (seg_ids[:, :, None] > 0)
-    return (block & causal[None, :, :])[:, None, :, :]
-
-
-def make_cross_packing_mask(enc_seg_ids, dec_seg_ids):
-    """Cross-attention mask for packed sequences.
-
-    enc_seg_ids: (B, T_enc) int segment IDs.
-    dec_seg_ids: (B, T_dec) int segment IDs.
-    Returns: (B, 1, T_dec, T_enc) bool mask — decoder token d attends to
-    encoder token e iff they share the same non-zero segment ID.
-    """
-    # (B, T_dec, 1) == (B, 1, T_enc) -> (B, T_dec, T_enc)
-    mask = (dec_seg_ids[:, :, None] == enc_seg_ids[:, None, :]) & (dec_seg_ids[:, :, None] > 0)
+    mask = block & causal[None, :, :]
+    if window:
+        pos = jnp.arange(T)
+        recent = (pos[:, None] - pos[None, :]) < window
+        sink = (jnp.zeros_like(seg_ids, dtype=jnp.bool_) if prefix is None
+                else prefix > 0)
+        mask = mask & (recent[None, :, :] | sink[:, None, :])
     return mask[:, None, :, :]

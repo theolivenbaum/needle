@@ -1,591 +1,183 @@
-using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
 using Needle.Tokenizer;
 
 namespace Needle.Training;
 
 /// <summary>
-/// A single training example: a natural-language query, the available tools
-/// (JSON-array string), and the expected tool-call answer (JSON-array string).
+/// One fine-tuning example.
+///
+/// Matches the JSONL contract in the upstream README: a query, the schemas that
+/// were available, the calls that satisfy it, and optionally the model's short
+/// derivation.  An off-topic example has <c>answers: []</c> — that is how the
+/// refusal behaviour is taught, so those rows are load-bearing rather than noise.
 /// </summary>
-public sealed record FinetuneExample(string Query, string Tools, string Answers);
+/// <param name="Query">The user request, or a passage to extract from.</param>
+/// <param name="ToolsJson">Declared schemas as a compact JSON array.</param>
+/// <param name="AnswersJson">Expected calls as a compact JSON array.</param>
+/// <param name="Reasoning">Short derivation of each argument; may be empty.</param>
+/// <param name="System">Optional system facts turn.</param>
+public sealed record FinetuneExample(
+    string Query,
+    string ToolsJson,
+    string AnswersJson,
+    string Reasoning = "",
+    string System = "")
+{
+    /// <summary>Name of the first declared call, used to stratify splits.</summary>
+    public string PrimaryTool
+    {
+        get
+        {
+            try
+            {
+                if (JsonNode.Parse(AnswersJson) is JsonArray { Count: > 0 } answers
+                    && answers[0] is JsonObject first)
+                    return first["name"]?.GetValue<string>() ?? "";
+            }
+            catch (JsonException)
+            {
+                // Fall through to the empty name.
+            }
+            return "";
+        }
+    }
+
+    /// <summary>True when no declared tool can serve the query.</summary>
+    public bool IsRefusal => AnswersJson.Trim() is "" or "[]";
+}
 
 /// <summary>
-/// Load and prepare JSONL finetune data.
-/// Mirrors the input contract of <c>needle/training/finetune.py</c>:
-/// each line is a JSON object with <c>query</c>, <c>tools</c>, and
-/// <c>answers</c> string fields.
+/// Reads and prepares Needle 2 fine-tuning data.
+/// Port of the JSONL handling in <c>.reference/needle/model/finetune.py</c>.
 /// </summary>
 public static class JsonlDataset
 {
+    private static readonly JsonSerializerOptions Compact = new()
+    {
+        WriteIndented = false,
+        // Python's json.dumps escapes non-ASCII by default; keeping the text raw
+        // here is the closer match for tool schemas, which are almost always
+        // ASCII, and avoids over-escaping punctuation in descriptions.
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
     /// <summary>
-    /// Read examples from a JSONL file.  Skips blank lines and lines that
-    /// fail to parse.
+    /// Read examples from a JSONL file.  <c>tools</c> and <c>answers</c> may be
+    /// given either as JSON arrays or as pre-serialised strings; blank and
+    /// malformed lines are skipped, as are rows with no <c>query</c>.
     /// </summary>
     public static List<FinetuneExample> Load(string path)
     {
         var examples = new List<FinetuneExample>();
-        foreach (var line in File.ReadLines(path))
+        foreach (string line in File.ReadLines(path))
         {
             if (string.IsNullOrWhiteSpace(line)) continue;
             try
             {
-                var node = JsonNode.Parse(line);
-                if (node is not JsonObject obj) continue;
+                if (JsonNode.Parse(line) is not JsonObject row) continue;
+                if (row["query"]?.GetValue<string>() is not { } query) continue;
 
-                string query   = obj["query"]?.GetValue<string>()   ?? "";
-                string tools   = obj["tools"]?.GetValue<string>()   ?? "[]";
-                string answers = obj["answers"]?.GetValue<string>() ?? "[]";
-                examples.Add(new FinetuneExample(query, tools, answers));
+                examples.Add(new FinetuneExample(
+                    query,
+                    AsJsonArray(row["tools"]),
+                    AsJsonArray(row["answers"] ?? row["function_calls"]),
+                    row["reasoning"]?.GetValue<string>() ?? "",
+                    row["system"]?.GetValue<string>() ?? ""));
             }
             catch (JsonException)
             {
-                // Skip malformed lines
+                // Skip malformed lines rather than failing the whole file.
             }
         }
         return examples;
     }
 
-    /// <summary>
-    /// Per-tool 80/10/10-style split.  Each unique primary tool name receives
-    /// <paramref name="valPerTool"/> validation examples and
-    /// <paramref name="testPerTool"/> test examples (proportional fallback for
-    /// rare tools).  Mirrors <c>_per_tool_split</c> in finetune.py.
-    /// </summary>
-    public static (List<FinetuneExample> train, List<FinetuneExample> val, List<FinetuneExample> test)
-        PerToolSplit(IList<FinetuneExample> examples, int valPerTool = 10, int testPerTool = 10, int seed = 42)
+    /// <summary>Serialise a node to the compact JSON array the template expects.</summary>
+    private static string AsJsonArray(JsonNode? node) => node switch
     {
-        var rng = new Random(seed);
-        var buckets = new Dictionary<string, List<int>>();
+        null => "[]",
+        JsonValue value when value.TryGetValue(out string? text) => text ?? "[]",
+        _ => node.ToJsonString(Compact),
+    };
 
-        for (int i = 0; i < examples.Count; i++)
+    /// <summary>
+    /// Render and tokenize one example into a training sequence.
+    /// Port of <c>_encode</c> in finetune.py.
+    /// </summary>
+    /// <param name="tokenizer">Tokenizer matching the checkpoint.</param>
+    /// <param name="example">The example to encode.</param>
+    /// <param name="maxLength">Sequence length; shorter rows are padded.</param>
+    /// <returns>
+    /// Token IDs and a loss mask that is 1 only over the target continuation, so
+    /// the prompt is conditioned on but never trained against.
+    /// </returns>
+    public static (int[] Ids, float[] LossMask) Encode(
+        CactTokenizer tokenizer, FinetuneExample example, int maxLength)
+    {
+        string prompt = ChatTemplate.Prompt(example.Query, example.ToolsJson,
+                                            string.IsNullOrEmpty(example.System) ? null : example.System);
+        string target = ChatTemplate.Target(example.AnswersJson, example.Reasoning);
+
+        var promptIds = tokenizer.Encode(prompt);
+        var targetIds = tokenizer.Encode(target);
+
+        var ids = new int[maxLength];
+        var mask = new float[maxLength];
+        ids.AsSpan().Fill(ChatMarkers.PadId);
+
+        int cursor = 0;
+        if (cursor < maxLength) ids[cursor++] = tokenizer.BosId;
+        foreach (int id in promptIds)
         {
-            string primary = "__no_tool__";
-            try
-            {
-                if (JsonNode.Parse(examples[i].Answers) is JsonArray arr && arr.Count > 0
-                    && arr[0] is JsonObject c0 && c0["name"]?.GetValue<string>() is string n)
-                {
-                    primary = n;
-                }
-            }
-            catch (JsonException) { }
-            if (!buckets.TryGetValue(primary, out var list))
-            {
-                list = new List<int>();
-                buckets[primary] = list;
-            }
-            list.Add(i);
+            if (cursor >= maxLength) break;
+            ids[cursor++] = id;
+        }
+        foreach (int id in targetIds)
+        {
+            if (cursor >= maxLength) break;
+            ids[cursor] = id;
+            mask[cursor++] = 1f;
+        }
+        if (cursor < maxLength)
+        {
+            ids[cursor] = tokenizer.EosId;
+            mask[cursor] = 1f;
         }
 
+        return (ids, mask);
+    }
+
+    /// <summary>
+    /// Stratified split holding out a bounded number of examples per primary
+    /// tool, so every tool is represented in validation and test rather than only
+    /// the common ones.  Mirrors the per-tool split in the reference finetuner.
+    /// </summary>
+    public static (List<FinetuneExample> Train, List<FinetuneExample> Validation, List<FinetuneExample> Test)
+        PerToolSplit(IReadOnlyList<FinetuneExample> examples,
+                     int validationPerTool = 10, int testPerTool = 10, int seed = 42)
+    {
+        var random = new Random(seed);
         var train = new List<FinetuneExample>();
-        var val   = new List<FinetuneExample>();
-        var test  = new List<FinetuneExample>();
+        var validation = new List<FinetuneExample>();
+        var test = new List<FinetuneExample>();
 
-        foreach (var (_, indices) in buckets)
+        foreach (var group in examples.GroupBy(e => e.PrimaryTool))
         {
-            // Fisher-Yates shuffle
-            for (int i = indices.Count - 1; i > 0; i--)
-            {
-                int j = rng.Next(i + 1);
-                (indices[i], indices[j]) = (indices[j], indices[i]);
-            }
+            var shuffled = group.OrderBy(_ => random.Next()).ToList();
 
-            int n = indices.Count;
-            int needed = valPerTool + testPerTool;
-            int nTest, nVal;
-            if (n < needed)
-            {
-                if (n == 1)      { nTest = 1; nVal = 0; }
-                else if (n == 2) { nTest = 1; nVal = 1; }
-                else
-                {
-                    nTest = System.Math.Max(1, n / 3);
-                    nVal  = System.Math.Max(1, (n - nTest) / 3);
-                }
-            }
-            else
-            {
-                nTest = testPerTool;
-                nVal  = valPerTool;
-            }
+            // A small group would otherwise donate everything to the held-out
+            // sets, so cap each share at a fifth of the group.
+            int cap = System.Math.Max(0, shuffled.Count / 5);
+            int validationCount = System.Math.Min(validationPerTool, cap);
+            int testCount = System.Math.Min(testPerTool, cap);
 
-            int idx = 0;
-            for (int k = 0; k < nTest && idx < n; k++, idx++) test.Add(examples[indices[idx]]);
-            for (int k = 0; k < nVal  && idx < n; k++, idx++) val.Add(examples[indices[idx]]);
-            for (; idx < n; idx++) train.Add(examples[indices[idx]]);
+            validation.AddRange(shuffled.Take(validationCount));
+            test.AddRange(shuffled.Skip(validationCount).Take(testCount));
+            train.AddRange(shuffled.Skip(validationCount + testCount));
         }
 
-        return (train, val, test);
-    }
-}
-
-/// <summary>
-/// Token-class labels used to bias the cross-entropy loss in
-/// <c>training/train.py</c>:
-/// 0 = base, 1 = tool name, 2 = argument value, 3 = argument key.
-/// </summary>
-public static class TokenClass
-{
-    public const int Base  = 0;
-    public const int Name  = 1;
-    public const int Value = 2;
-    public const int Key   = 3;
-}
-
-/// <summary>
-/// Build encoder and decoder token sequences (plus class labels) for one
-/// <see cref="FinetuneExample"/>, ready to be assembled into a
-/// <see cref="TrainingBatch"/>.
-///
-/// Mirrors the per-example logic inside <c>prepare_tool_call_pairs</c> in
-/// <c>needle/dataset/dataset.py</c>.
-/// </summary>
-public static class FinetuneExampleBuilder
-{
-    private const string ToolCallText = "<tool_call>";
-    private const string ToolsSepText = "<tools>";
-
-    /// <summary>
-    /// Result of tokenising one example.
-    /// </summary>
-    /// <param name="EncTokens">Encoder tokens: <c>[query…, &lt;tools&gt;, tools…]</c></param>
-    /// <param name="DecInTokens">Decoder input tokens: <c>[EOS, &lt;tool_call&gt;, answer…]</c></param>
-    /// <param name="DecOutTokens">Decoder target tokens: <c>[&lt;tool_call&gt;, answer…, EOS]</c></param>
-    /// <param name="ClassLabels">Per-decoder-target-position class label (0..3).</param>
-    public sealed record Built(
-        int[] EncTokens,
-        int[] DecInTokens,
-        int[] DecOutTokens,
-        int[] ClassLabels);
-
-    /// <summary>
-    /// Tokenise one example.  Returns <c>null</c> if the answer is too long for
-    /// the decoder budget (the Python pipeline drops these examples).
-    /// </summary>
-    public static Built? Build(
-        INeedleTokenizer tokenizer,
-        FinetuneExample example,
-        int maxEncLen = 1024,
-        int maxDecLen = 512)
-    {
-        int padId       = tokenizer.PadTokenId;
-        int eosId       = tokenizer.EosTokenId;
-        int toolsSepId  = tokenizer.ToolsTokenId;
-        int toolCallId  = tokenizer.ToolCallTokenId;
-
-        var qToks = tokenizer.Encode(example.Query).ToList();
-        var tToks = tokenizer.Encode(example.Tools).ToList();
-        var aToks = tokenizer.Encode(example.Answers).ToList();
-
-        int maxQuery = maxEncLen - 2;
-        if (qToks.Count > maxQuery) qToks.RemoveRange(maxQuery, qToks.Count - maxQuery);
-        int remaining = maxEncLen - qToks.Count - 1;
-        if (tToks.Count > remaining) tToks.RemoveRange(remaining, tToks.Count - remaining);
-
-        var enc = new List<int>(qToks.Count + 1 + tToks.Count);
-        enc.AddRange(qToks);
-        enc.Add(toolsSepId);
-        enc.AddRange(tToks);
-
-        // Decoder input needs 2 special tokens + the answer; target needs
-        // 1 special + answer + EOS.  Both must fit in maxDecLen.
-        if (2 + aToks.Count + 1 > maxDecLen)
-            return null;
-
-        var decIn  = new int[2 + aToks.Count];
-        var decOut = new int[1 + aToks.Count + 1];
-
-        decIn[0]  = eosId;
-        decIn[1]  = toolCallId;
-        for (int i = 0; i < aToks.Count; i++) decIn[i + 2] = aToks[i];
-
-        decOut[0] = toolCallId;
-        for (int i = 0; i < aToks.Count; i++) decOut[i + 1] = aToks[i];
-        decOut[decOut.Length - 1] = eosId;
-
-        var classes = ComputeAnswerClassLabels(tokenizer, example.Answers, aToks, decOut.Length);
-        return new Built(enc.ToArray(), decIn, decOut, classes);
-    }
-
-    /// <summary>
-    /// Compute per-token class labels (0=base, 1=name, 2=value, 3=key) for the
-    /// decoder target sequence.  Falls back to all-zeros if the answer cannot
-    /// be parsed.
-    ///
-    /// Simplified port of <c>_token_classes_for_answer</c> in dataset.py.
-    /// </summary>
-    public static int[] ComputeAnswerClassLabels(
-        INeedleTokenizer tokenizer,
-        string answersJson,
-        IReadOnlyList<int> answerTokens,
-        int totalLen)
-    {
-        // The decoder target has shape [<tool_call>, answer..., EOS] so the
-        // class array is also of length totalLen.  Class labels live at
-        // positions [1 .. 1 + answerTokens.Count - 1].  The leading
-        // <tool_call> and trailing EOS get class 0 (base).
-        var classes = new int[totalLen];
-
-        if (answerTokens.Count == 0) return classes;
-
-        // Character-level class array over the original answer string.
-        int len = answersJson.Length;
-        var charCls = new byte[len];
-
-        try
-        {
-            var node = JsonNode.Parse(answersJson);
-            if (node is not JsonArray calls) return classes;
-
-            foreach (var c in calls)
-            {
-                if (c is not JsonObject call) continue;
-                if (call["name"]?.GetValue<string>() is string name && name.Length > 0)
-                    MarkJsonValue(answersJson, charCls, "name", name, TokenClass.Name);
-                if (call["arguments"] is JsonObject argsObj)
-                {
-                    foreach (var (k, v) in argsObj)
-                    {
-                        MarkJsonKeyInArgs(answersJson, charCls, k, TokenClass.Key);
-                        string vStr = v is JsonValue jv && jv.TryGetValue(out string? s) ? s! : v?.ToJsonString() ?? "";
-                        MarkJsonValue(answersJson, charCls, k, vStr, TokenClass.Value);
-                    }
-                }
-            }
-        }
-        catch (JsonException)
-        {
-            return classes;
-        }
-
-        // Walk through tokens and aggregate the max char class touched by each
-        // piece.  We need to know each piece's text length — re-encode using a
-        // SentencePiece-style walk.  Since IdToPiece returns the piece with
-        // ▁ → space, we can lay them down sequentially.
-        int pos = 0;
-        for (int i = 0; i < answerTokens.Count; i++)
-        {
-            string piece = tokenizer.IdToPiece(answerTokens[i]);
-            int pieceLen = piece.Length;
-            byte best = 0;
-            if (pieceLen > 0 && pos + pieceLen <= len)
-            {
-                for (int j = 0; j < pieceLen; j++)
-                    if (charCls[pos + j] > best) best = charCls[pos + j];
-                pos += pieceLen;
-            }
-            else
-            {
-                pos += System.Math.Max(pieceLen, 1);
-            }
-            classes[1 + i] = best;
-        }
-
-        return classes;
-    }
-
-    private static void MarkJsonValue(string s, byte[] charCls, string key, string value, int label)
-    {
-        // Try quoted form first: "key": "value"
-        string keyEsc  = Regex.Escape(key);
-        string valEsc  = Regex.Escape(value);
-
-        var rxQuoted = new Regex($"\"{keyEsc}\"\\s*:\\s*\"{valEsc}\"");
-        var match = rxQuoted.Match(s);
-        if (match.Success)
-        {
-            // Find the value start (after the opening quote of the value).
-            int searchStart = match.Index + ($"\"{key}\"").Length;
-            int valStart    = s.IndexOf('"', searchStart) + 1;
-            int valEnd      = valStart + value.Length;
-            for (int i = valStart; i < valEnd && i < charCls.Length; i++)
-                if (charCls[i] < label) charCls[i] = (byte)label;
-            return;
-        }
-
-        // Unquoted form: "key": value
-        var rxBare = new Regex($"\"{keyEsc}\"\\s*:\\s*{valEsc}");
-        match = rxBare.Match(s);
-        if (match.Success)
-        {
-            int colonIdx = s.IndexOf(':', match.Index);
-            int valStart = colonIdx + 1;
-            while (valStart < match.Index + match.Length && s[valStart] == ' ') valStart++;
-            int valEnd = match.Index + match.Length;
-            for (int i = valStart; i < valEnd && i < charCls.Length; i++)
-                if (charCls[i] < label) charCls[i] = (byte)label;
-        }
-    }
-
-    private static void MarkJsonKeyInArgs(string s, byte[] charCls, string key, int label)
-    {
-        string keyEsc = Regex.Escape(key);
-        var rx = new Regex($"\"{keyEsc}\"\\s*:");
-        foreach (Match m in rx.Matches(s))
-        {
-            int start = m.Index + 1;
-            int end   = start + key.Length;
-            for (int i = start; i < end && i < charCls.Length; i++)
-                if (charCls[i] < label) charCls[i] = (byte)label;
-        }
-    }
-}
-
-/// <summary>
-/// Assemble <see cref="FinetuneExample"/>s into padded
-/// <see cref="TrainingBatch"/> records that the <see cref="Trainer"/>
-/// can consume directly.
-///
-/// Single-example packing: every batch row holds one example with
-/// segment ID 1 for the real tokens and 0 for padding.  This produces correct
-/// padding masks; full multi-example packing (the Python `pack_sequences`
-/// path) is out of scope for the local finetune flow.
-/// </summary>
-public static class BatchBuilder
-{
-    /// <summary>
-    /// Build a single padded batch from up to <c>batchSize</c> examples.
-    /// </summary>
-    /// <param name="examples">Source examples (only the first <c>batchSize</c> are used).</param>
-    /// <param name="tokenizer">Tokeniser to use.</param>
-    /// <param name="batchSize">Target batch size.  Smaller batches are returned if fewer examples remain.</param>
-    /// <param name="maxEncLen">Encoder budget per row.</param>
-    /// <param name="maxDecLen">Decoder budget per row.</param>
-    public static TrainingBatch? BuildBatch(
-        IList<FinetuneExample> examples,
-        INeedleTokenizer tokenizer,
-        int batchSize,
-        int maxEncLen = 1024,
-        int maxDecLen = 512)
-    {
-        int padId = tokenizer.PadTokenId;
-        int take  = System.Math.Min(batchSize, examples.Count);
-        if (take == 0) return null;
-
-        var built = new List<FinetuneExampleBuilder.Built>();
-        for (int i = 0; i < take; i++)
-        {
-            var b = FinetuneExampleBuilder.Build(tokenizer, examples[i], maxEncLen, maxDecLen);
-            if (b is not null) built.Add(b);
-        }
-        if (built.Count == 0) return null;
-
-        int B = built.Count;
-        int encLen = built.Max(b => b.EncTokens.Length);
-        int decLen = built.Max(b => System.Math.Max(b.DecInTokens.Length, b.DecOutTokens.Length));
-
-        var src    = new long[B, encLen];
-        var tgtIn  = new long[B, decLen];
-        var tgtOut = new long[B, decLen];
-        var lm     = new int [B, decLen];
-        var encSeg = new int [B, encLen];
-        var decSeg = new int [B, decLen];
-
-        for (int i = 0; i < B; i++) for (int j = 0; j < encLen; j++) src[i, j]    = padId;
-        for (int i = 0; i < B; i++) for (int j = 0; j < decLen; j++) tgtIn[i, j]  = padId;
-        for (int i = 0; i < B; i++) for (int j = 0; j < decLen; j++) tgtOut[i, j] = padId;
-
-        for (int i = 0; i < B; i++)
-        {
-            var b = built[i];
-            for (int j = 0; j < b.EncTokens.Length; j++)
-            {
-                src[i, j]    = b.EncTokens[j];
-                encSeg[i, j] = 1;
-            }
-            for (int j = 0; j < b.DecInTokens.Length; j++)
-                tgtIn[i, j] = b.DecInTokens[j];
-            for (int j = 0; j < b.DecOutTokens.Length; j++)
-            {
-                tgtOut[i, j] = b.DecOutTokens[j];
-                decSeg[i, j] = 1;
-                lm[i, j]     = b.ClassLabels[j];
-            }
-        }
-
-        return new TrainingBatch(src, tgtIn, tgtOut, lm, encSeg, decSeg);
-    }
-
-    /// <summary>
-    /// Enumerate <paramref name="examples"/> in non-overlapping batches.
-    /// </summary>
-    public static IEnumerable<TrainingBatch> Iterate(
-        IList<FinetuneExample> examples,
-        INeedleTokenizer tokenizer,
-        int batchSize,
-        int maxEncLen = 1024,
-        int maxDecLen = 512)
-    {
-        for (int start = 0; start < examples.Count; start += batchSize)
-        {
-            int end   = System.Math.Min(start + batchSize, examples.Count);
-            var slice = examples.Skip(start).Take(end - start).ToList();
-            var batch = BuildBatch(slice, tokenizer, batchSize, maxEncLen, maxDecLen);
-            if (batch is not null) yield return batch;
-        }
-    }
-
-    /// <summary>
-    /// First-fit-decreasing bin packing of <paramref name="examples"/> into
-    /// fixed-width rows of length (<paramref name="maxEncLen"/>,
-    /// <paramref name="maxDecLen"/>).  Multiple examples are concatenated into
-    /// a single row, separated by incrementing segment IDs.  Per-example
-    /// padding within a row is zero — the segment IDs make
-    /// <see cref="MaskUtils.MakePackingMask"/> and friends produce the right
-    /// block-diagonal masks.
-    ///
-    /// Port of <c>pack_sequences</c> in needle/dataset/dataset.py.
-    /// </summary>
-    /// <param name="examples">Source examples to pack.</param>
-    /// <param name="tokenizer">Tokeniser to use.</param>
-    /// <param name="maxEncLen">Bin width on the encoder side.</param>
-    /// <param name="maxDecLen">Bin width on the decoder side.</param>
-    /// <returns>One <see cref="TrainingBatch"/> whose first dimension is the
-    /// number of packed bins.  Examples that don't fit individually (oversize)
-    /// are dropped (same behaviour as the Python pipeline).</returns>
-    public static TrainingBatch? PackBatch(
-        IList<FinetuneExample> examples,
-        INeedleTokenizer tokenizer,
-        int maxEncLen = 1024,
-        int maxDecLen = 512)
-    {
-        int padId = tokenizer.PadTokenId;
-
-        // Tokenise + sort by encoder length descending (FFD heuristic).
-        var built = new List<FinetuneExampleBuilder.Built>(examples.Count);
-        foreach (var ex in examples)
-        {
-            var b = FinetuneExampleBuilder.Build(tokenizer, ex, maxEncLen, maxDecLen);
-            if (b is null) continue;
-            if (b.EncTokens.Length > maxEncLen || b.DecInTokens.Length > maxDecLen) continue;
-            built.Add(b);
-        }
-        if (built.Count == 0) return null;
-
-        built.Sort((a, b) => b.EncTokens.Length.CompareTo(a.EncTokens.Length));
-
-        // Each bin tracks remaining capacity + the example indices in it.
-        var encRem    = new List<int>();
-        var decRem    = new List<int>();
-        var binItems  = new List<List<int>>();
-
-        for (int i = 0; i < built.Count; i++)
-        {
-            int el = built[i].EncTokens.Length;
-            int dl = System.Math.Max(built[i].DecInTokens.Length, built[i].DecOutTokens.Length);
-
-            int placed = -1;
-            for (int bIdx = 0; bIdx < encRem.Count; bIdx++)
-            {
-                if (encRem[bIdx] >= el && decRem[bIdx] >= dl)
-                {
-                    placed = bIdx;
-                    break;
-                }
-            }
-            if (placed < 0)
-            {
-                encRem.Add(maxEncLen - el);
-                decRem.Add(maxDecLen - dl);
-                binItems.Add(new List<int> { i });
-            }
-            else
-            {
-                encRem[placed] -= el;
-                decRem[placed] -= dl;
-                binItems[placed].Add(i);
-            }
-        }
-
-        int nBins = binItems.Count;
-        var src    = new long[nBins, maxEncLen];
-        var tgtIn  = new long[nBins, maxDecLen];
-        var tgtOut = new long[nBins, maxDecLen];
-        var lm     = new int [nBins, maxDecLen];
-        var encSeg = new int [nBins, maxEncLen];
-        var decSeg = new int [nBins, maxDecLen];
-
-        for (int i = 0; i < nBins; i++) for (int j = 0; j < maxEncLen; j++) src[i, j]    = padId;
-        for (int i = 0; i < nBins; i++) for (int j = 0; j < maxDecLen; j++) tgtIn[i, j]  = padId;
-        for (int i = 0; i < nBins; i++) for (int j = 0; j < maxDecLen; j++) tgtOut[i, j] = padId;
-
-        for (int row = 0; row < nBins; row++)
-        {
-            int encPos = 0;
-            int decPos = 0;
-            int segId  = 1;
-            foreach (int idx in binItems[row])
-            {
-                var b = built[idx];
-                for (int j = 0; j < b.EncTokens.Length; j++)
-                {
-                    src[row, encPos + j]    = b.EncTokens[j];
-                    encSeg[row, encPos + j] = segId;
-                }
-                for (int j = 0; j < b.DecInTokens.Length; j++)
-                    tgtIn[row, decPos + j] = b.DecInTokens[j];
-                for (int j = 0; j < b.DecOutTokens.Length; j++)
-                {
-                    tgtOut[row, decPos + j] = b.DecOutTokens[j];
-                    decSeg[row, decPos + j] = segId;
-                    lm[row, decPos + j]     = b.ClassLabels[j];
-                }
-                encPos += b.EncTokens.Length;
-                decPos += System.Math.Max(b.DecInTokens.Length, b.DecOutTokens.Length);
-                segId  += 1;
-            }
-        }
-
-        return new TrainingBatch(src, tgtIn, tgtOut, lm, encSeg, decSeg);
-    }
-
-    /// <summary>
-    /// Yield packed batches of up to <paramref name="binsPerBatch"/> rows.
-    /// Convenience wrapper around <see cref="PackBatch"/> that lets the
-    /// trainer consume packed bins in fixed-size mini-batches.
-    /// </summary>
-    public static IEnumerable<TrainingBatch> IteratePacked(
-        IList<FinetuneExample> examples,
-        INeedleTokenizer tokenizer,
-        int binsPerBatch,
-        int maxEncLen = 1024,
-        int maxDecLen = 512)
-    {
-        var all = PackBatch(examples, tokenizer, maxEncLen, maxDecLen);
-        if (all is null) yield break;
-
-        int nBins = all.SrcTokens.GetLength(0);
-        for (int start = 0; start < nBins; start += binsPerBatch)
-        {
-            int end = System.Math.Min(start + binsPerBatch, nBins);
-            int B = end - start;
-
-            var src    = new long[B, maxEncLen];
-            var tgtIn  = new long[B, maxDecLen];
-            var tgtOut = new long[B, maxDecLen];
-            var lm     = new int [B, maxDecLen];
-            var encSeg = new int [B, maxEncLen];
-            var decSeg = new int [B, maxDecLen];
-
-            for (int i = 0; i < B; i++)
-            {
-                for (int j = 0; j < maxEncLen; j++)
-                {
-                    src[i, j]    = all.SrcTokens[start + i, j];
-                    encSeg[i, j] = all.EncSegIds[start + i, j];
-                }
-                for (int j = 0; j < maxDecLen; j++)
-                {
-                    tgtIn[i, j]  = all.TgtInTokens[start + i, j];
-                    tgtOut[i, j] = all.TgtOutTokens[start + i, j];
-                    lm[i, j]     = all.LossMask[start + i, j];
-                    decSeg[i, j] = all.DecSegIds[start + i, j];
-                }
-            }
-            yield return new TrainingBatch(src, tgtIn, tgtOut, lm, encSeg, decSeg);
-        }
+        return (train, validation, test);
     }
 }

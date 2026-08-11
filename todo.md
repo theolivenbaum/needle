@@ -1,92 +1,92 @@
-# Port Status: Python → .NET 10
+# Port status: Needle 2 → .NET 10
 
-Snapshot of what the C# port (under `src/Needle`, `src/Needle.Cli`,
-`tests/Needle.Tests`) covers, relative to the Python reference under
-`.reference/needle` (mirrored in `needle/`).
+What the C# implementation under `src/` covers relative to the vendored
+reference in `.reference/needle`, and what it deliberately does not.
 
-## Ported and tested
+Upstream synced at `cactus-compute/needle@8b01d9f` (2026-08-10), the Needle 2
+release. That release replaced the encoder-decoder tool-caller entirely, so the
+previous port was rewritten rather than extended: no TorchSharp, no
+`Microsoft.ML.Tokenizers`, one NuGet dependency (`System.Numerics.Tensors`).
 
-| Python module                       | C# location                                                |
-|-------------------------------------|------------------------------------------------------------|
-| `model/architecture.py`             | `Model/NeedleModel.cs`, `Model/RoPE.cs`, `Model/TransformerConfig.cs`, `Model/MaskUtils.cs` |
-| `model/run.py` (generate, retrieve) | `Inference/Runner.cs`                                      |
-| `model/constrained.py`              | `Inference/ConstrainedDecoding.cs`                         |
-| `dataset/tokenizer.py`              | `Tokenizer/NeedleTokenizer.cs`, `Tokenizer/INeedleTokenizer.cs` |
-| `model/run.py` (tool normalize)     | `Inference/ToolNormalizer.cs`                              |
-| `training/train.py` (loss core)     | `Training/LossFunctions.cs`, `Training/Trainer.cs`         |
-| `training/optim.py`                 | `Training/MuonOptimizer.cs`, `Training/LRSchedule.cs`      |
-| `model/quantize.py`                 | `Model/Quantize.cs` ✨                                      |
-| `model/architecture.py` (matryoshka)| `Model/NeedleModel.cs::ForwardMasked` + FFN mask plumbing ✨|
-| `model/architecture.py` (contrastive twin)| `Model/NeedleModel.cs::ForwardContrastive` ✨        |
-| `model/export.py`                   | `Weights/SubmodelExport.cs` ✨                              |
-| `training/eval.py` (tool-call F1)   | `Inference/ToolCallMetrics.cs` ✨                           |
-| `training/eval.py` (perplexity)     | `Training/PerplexityEval.cs` ✨                             |
-| `training/eval.py` (throughput, repetition, generation-quality, WER, retrieval Recall@k / MRR) | `Inference/GenerationBenchmarks.cs` ✱ |
-| `training/finetune.py` (JSONL flow) | `Training/JsonlDataset.cs`, `Training/JsonlFinetuner.cs` ✨ |
-| `cli.py` (run/eval/finetune/export) | `src/Needle.Cli/CliEntry.cs` ✨                             |
-| n/a (own binary format)             | `Weights/WeightLoader.cs` (.ndlw + safetensors)            |
-| `training/train.py` (CLIP step)     | `Training/Trainer.cs::TrainStepWithContrastive` ✦          |
-| `dataset/dataset.py` (`pack_sequences`) | `Training/JsonlDataset.cs::BatchBuilder.PackBatch` ✦   |
-| `model/architecture.py` (RoPE cache)| `Model/NeedleModel.cs::GetRope` (per-device cache) ✦       |
+## Implemented and verified
 
-✨ added on branch `claude/investigate-port-gaps-Z1hjA`.
-✦ added on branch `claude/test-implement-missing-Xip11`.
-✱ added on branch `claude/test-implement-missing-G5KET`.
+| Reference | C# | Verified by |
+|---|---|---|
+| `model/architecture.py` — attention, Hadamard MLP, engram, MHC stack, heads | `Model/Needle2Model.cs`, `Model/StackState.cs`, `Model/EngramHash.cs`, `Model/RoPE.cs`, `Model/SequenceMask.cs`, `Model/AttentionPlan.cs` | per-layer parity on the released weights |
+| `model/decode.py` — KV cache, sliding window, engram window | `Inference/NeedleSession.cs` | token-identical greedy continuation |
+| `model/quantize.py` — Cactus-Quant codec | `Weights/CactusQuant.cs` | all 404 tensors vs `read_export` |
+| `model/export.py` — `.cact` container and geometry recovery | `Weights/CactFile.cs`, `Weights/CactLayout.cs` | as above, plus a loaded-and-run assertion |
+| `model/export.py` — `RefTokenizer` | `Tokenizer/CactTokenizer.cs` | 18/18 encode+decode cases |
+| `model/tokenizer.py` — reserved IDs and chat markers | `Tokenizer/ChatMarkers.cs` | ID assignment asserted against the blob |
+| `model/finetune.py` — `render_example`, JSONL contract | `Tokenizer/ChatMarkers.cs` (`ChatTemplate`), `Training/JsonlDataset.cs` | unit tests |
+| `needle/__init__.py` — the `Needle` session API | `Inference/NeedleAgent.cs` | end-to-end calls from `needle2.cact` |
+| `architecture.py` — `kv_budget_window` | `Model/SequenceMask.cs` (`KvBudget`) | unit tests |
+| `model/quantize.py` — inference on packed weights | `Weights/QuantizedMatrix.cs`, `Weights/CactWeights.cs`, `Model/WeightViews.cs` | identical token streams to the float32 path, plus a direct test of the packed matmul against the dense reconstruction |
+| n/a — safetensors interchange | `Weights/Safetensors.cs` | round-trips the reference dumps |
+| grammar-constrained decoding (upstream moved this into its compiled engine) | `Inference/ConstrainedDecoding.cs`, wired into `NeedleAgent` | unit tests; observed to correct an out-of-schema argument on a real call |
+| `model/finetune.py` — `init_lora`, `LORA_TARGETS`, the AdamW + warmup-cosine loop | `Training/Autodiff/`, `Training/TrainableModel.cs`, `Training/LoraAdapter.cs`, `Training/AdamW.cs`, `Training/Finetuner.cs` | forward parity against the inference model, finite-difference gradient checks, a fine-tune on the released weights |
 
-146 xUnit tests pass across all of the above (`dotnet test`); the
-tokenizer-parity tests download `needle.model` from HuggingFace on
-first run via `NeedleTokenizerDownloader` and cache it locally — no
-env var needed.
+`dotnet test` → 141 tests. Six need the reference fixtures and skip cleanly when
+they are absent.
 
-End-to-end parity against Python on the published checkpoint
-(`Cactus-Compute/needle`) is exercised by the harness in
-`scripts/compare/`.  The harness reports zero mismatches on the
-spec JSON across:
+## Parity results
 
-  * tokenize (4/4 exact)
-  * tool-name normalization (4/4 exact)
-  * generation (4 cases, incl. constrained and tool-name normalized)
-  * batched generation (2 items exact)
-  * retrieval embeddings (within tolerance)
-  * training-step text + Z loss (within bf16-vs-fp32 drift)
-  * INT4 fake-quantization (exact at fp32 precision)
+Against `Cactus-Compute/needle2` (45M parameters, the released `.cact` and the
+float16 checkpoint behind it):
 
-Four bugs were surfaced and fixed by extending this harness:
-decode-once in `InferenceRunner.Generate`, layer-counting in
-`CliEntry.CountLayers`, the SentencePiece dummy-prefix mismatch
-around special tokens in `NeedleTokenizer`, and the attention mask
-using `-Infinity` instead of `finfo.min` (which produced NaN logits
-on any packed batch with padding — undetectable via single-example
-generation, but would have broken every training step).
+- every stage, three prompts: worst relative error **4.7e-5**, cosine > 0.99999
+- next-token argmax: **82/82** positions identical
+- KV-cached greedy decode: token stream identical to `decode.py`
+- `.cact` dequantisation: worst relative error **2.1e-5** across 404 tensors
+- tokenizer: **18/18** cases encode and decode identically
 
-## Intentionally NOT ported
+Regenerate with `scripts/parity/dump_reference.py` and
+`scripts/parity/dump_cact.py`, then `needle parity` / `needle cact-check`.
 
-These are infrastructure or Python-ecosystem dependent and outside the scope
-of an inference / local-finetune .NET runtime:
+One real defect was found this way: the stack was measuring each layer's
+residual against the *post*-engram-injection block input, where the reference
+measures it against the pre-injection read. Invisible for layers 0–1, a 12%
+error from layer 2 on. Nothing but a stage-by-stage comparison would have caught
+it — end-to-end argmax still mostly agreed.
 
-- `dataset/generate.py` — Gemini-based synthetic data generation
-- `ui/server.py` — Gradio-style web UI
-- `utils/distributed.py` — JAX-pmap multi-host data sharding
-- `utils/gcs.py` — Google Cloud Storage uploader
-- `utils/tpu.py` — `gcloud` TPU VM lifecycle management
-- `dataset/dataset.py` — HuggingFace download + arrow caching + multi-process
-  packing (the .NET side ships a simpler one-example-per-row JSONL loader
-  in `Training/JsonlDataset.cs`)
-- `dataset/tokenize.py` — bulk corpus pre-tokenisation on TPU pods
-- `training/pretrain.py` — pretrain on PleIAs/SYNTH (JAX/Flax specific)
-- `training/train.py` distributed code paths (host slicing, pmap, multihost
-  all-gather) — the .NET trainer is single-host
-- `model/run.py` pickle (`.pkl`) checkpoint loader — upstream weights are
-  published in safetensors format; convert externally if you only have a
-  `.pkl`
+## Not implemented
 
-## Known smaller gaps still open
+Inference-side gaps, in rough order of usefulness:
 
-(All previously listed smaller gaps are now closed — see the ✦ and ✱ rows
-in the table above.  Contrastive loss is wired into `Trainer` via
-`TrainStepWithContrastive`; multi-example bin packing is implemented in
-`BatchBuilder.PackBatch`/`IteratePacked`; RoPE tables are cached
-per-device on `SimpleAttentionNetwork.GetRope` and grow lazily up to
-`TransformerConfig.MaxSeqLen`; throughput, bigram-repetition,
-generation-quality, WER, and retrieval Recall@k/MRR benchmarks live in
-`Inference/GenerationBenchmarks.cs`.)
+- **The packed kernels need AVX-512 to be fast.** Both the two- and four-bit
+  inner loops decode a vector of weights with a lane permute of the codebook,
+  which needs `Avx512F`; without it they fall back to the byte-table and scalar
+  forms, which are roughly a third the speed. An AVX2 path is possible for four
+  bits (`PermuteVar8x32` covers eight of the sixteen entries, so it would take
+  two permutes and a blend) and for two bits (four entries fit one permute).
+
+- **The grammar only constrains names and argument keys**, not argument *values*.
+  Upstream's engine also compiles `Field` constraints — ranges, patterns,
+  lengths, enums, item counts — into the decode grammar, so a value that
+  violates the schema is unreachable. Here those still have to be validated
+  after the fact.
+- **`.cact` writing.** Reading is complete. Writing needs the 2/3/4-bit
+  Lloyd-Max codebooks, which the format carries in the header but which are
+  generated in Python from NumPy's legacy RandomState — reproducible only by
+  reimplementing MT19937 and Box-Muller exactly. A writer that reuses codebooks
+  read from an existing blob would be straightforward.
+- **Tool retrieval is not automatic.** `NeedleAgent.RetrieveTools` exposes the
+  contrastive head, but the agent does not yet drop to the top five tools and
+  rebuild the grammar when more than five are declared.
+- **Full fine-tuning.** Only LoRA on the five attention projections trains; the
+  autodiff layer under it is general, but nothing else is registered as a
+  parameter and the tape would have to retain the base activations to make it
+  worthwhile.
+- **Adapters do not export to `.cact`.** `LoraSet.Merge` folds them back into a
+  float32 weight set, which safetensors can carry, but writing a `.cact` needs
+  the codebook generation described above.
+
+## Intentionally out of scope
+
+Python-ecosystem infrastructure with no .NET counterpart:
+
+- `agent/fetch.py` — downloads the compiled inference engine
+- `playground/server.py` — the browser playground
+- `model/finetune.py` — the OpenRouter-backed synthetic data generation, which
+  is an API client rather than model code (the training loop itself is ported)
+- `cli.py` — the `needle` Python CLI (this repo has its own)

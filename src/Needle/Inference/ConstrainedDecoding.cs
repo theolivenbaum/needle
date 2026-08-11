@@ -545,36 +545,21 @@ public static class ConstrainedDecodingFactory
     ///
     /// Port of Python <c>build_token_strings</c> in constrained.py.
     /// </summary>
-    public static string[] BuildTokenStrings(NeedleTokenizer tokenizer)
+    public static string[] BuildTokenStrings(CactTokenizer tokenizer)
     {
         int vocabSize = tokenizer.VocabSize;
         var strings = new string[vocabSize];
 
         for (int i = 0; i < vocabSize; i++)
         {
-            if (tokenizer.IsByteToken(i))
+            strings[i] = tokenizer.Type(i) switch
             {
-                // Piece looks like <0x41>; extract the hex byte.
-                var piece = tokenizer.IdToPiece(i); // already has ▁→' ' but byte tokens don't have ▁
-                // Re-read raw to avoid the ▁→space replacement that doesn't apply here.
-                // IdToPiece replaces ▁ with ' ' but byte pieces don't contain ▁,
-                // so either method is equivalent. We need the original <0xNN> form.
-                // Use the vocabulary inverse via internal knowledge: IsByteToken checks
-                // the raw _idToPiece form. We call a separate method to get raw piece.
-                strings[i] = DecodeBytePiece(piece);
-            }
-            else
-            {
-                // IdToPiece already replaces ▁ → ' '.
-                // For control/special tokens the piece will be something like
-                // <pad>, <eos>, <tool_call>, etc. — we want to return empty
-                // for control tokens so they don't appear in constrained matching.
-                var piece = tokenizer.IdToPiece(i);
-                if (IsControlPiece(piece))
-                    strings[i] = string.Empty;
-                else
-                    strings[i] = piece;
-            }
+                // Control and unknown tokens contribute nothing to the surface
+                // text, so the grammar must never match against them.
+                PieceType.Control or PieceType.Unknown => string.Empty,
+                PieceType.Byte => DecodeBytePiece(tokenizer.Piece(i)),
+                _ => tokenizer.Piece(i).Replace(CactTokenizer.MetaSpace, " ", StringComparison.Ordinal),
+            };
         }
         return strings;
     }
@@ -631,10 +616,10 @@ public static class ConstrainedDecodingFactory
     /// Port of Python <c>build_constrained_decoder</c> in constrained.py.
     /// </summary>
     /// <param name="toolsJsonList">One tool-JSON string per batch element.</param>
-    /// <param name="tokenizer">Loaded <see cref="NeedleTokenizer"/>.</param>
+    /// <param name="tokenizer">Loaded <see cref="CactTokenizer"/>.</param>
     public static ConstrainedDecoder BuildConstrainedDecoder(
         IReadOnlyList<string> toolsJsonList,
-        NeedleTokenizer tokenizer)
+        CactTokenizer tokenizer)
     {
         var tokenStrings = BuildTokenStrings(tokenizer);
         var tokenIndex   = new TokenIndex(tokenStrings);

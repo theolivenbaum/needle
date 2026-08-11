@@ -138,3 +138,8 @@ TestResults/
 ## Logs
 *.log
 *.tmp
+# Parity fixtures and downloaded weights (regenerate with scripts/parity/dump_reference.py)
+fixtures/
+*.safetensors
+*.cact
+*.pkl

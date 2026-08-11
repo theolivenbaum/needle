@@ -1,47 +1,55 @@
-using System.Text.Encodings.Web;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Needle.Diagnostics;
 using Needle.Inference;
+using Needle.Math;
 using Needle.Model;
 using Needle.Tokenizer;
 using Needle.Training;
 using Needle.Weights;
-using TorchSharp;
-using static TorchSharp.torch;
 
 namespace Needle.Cli;
 
 /// <summary>
-/// Console entry point for the .NET port of <c>needle</c>.
-///
-/// Subset of the Python CLI from <c>needle/cli.py</c>: only the inference,
-/// evaluation, and local finetune commands are wired up — the dataset
-/// preparation, distributed-training, and TPU-management commands depend on
-/// Python-only infrastructure (HuggingFace datasets, Gemini, gcloud) and are
-/// out of scope on .NET.
+/// Console entry point for the .NET port of Needle 2.
 /// </summary>
 public static class CliEntry
 {
     private const string Help = """
-        needle — Simple Attention Network for on-device function calling
+        needle — Needle 2 Simple Attention Network, pure .NET
 
         Usage:
-          needle run           --checkpoint <path> --tokenizer <path> [--query <text>] [--tools <json>]
-          needle eval          --checkpoint <path> --tokenizer <path> --jsonl <path>
-          needle finetune      --checkpoint <path> --tokenizer <path> --jsonl <path> [--epochs N]
-          needle export        --checkpoint <path> --factor N --output <path>
-          needle dump-compare  --checkpoint <path> --tokenizer <path> --spec <path> --out <path>
+          needle parity     --fixtures <dir> [--tolerance 0.01] [--verbose]
+          needle cact-check --cact <file> --expected <dir> [--tolerance 1e-4] [--verbose]
+          needle info       --weights <dir|file|.cact> [--config <path>] [--dense]
+          needle run        --weights <dir|file|.cact> [--config <path>] --tokens 2,100 [--max-new 32] [--dense]
+          needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
+          needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense] [--profile]
+          needle finetune   --weights <file.cact> --data <file.jsonl> --out <adapter.safetensors>
+                            [--epochs 3] [--lr 1e-4] [--rank 16] [--alpha 32] [--max-len 128]
+                            [--batch-size 4] [--eval]
 
-        Notes:
-          * --checkpoint should be a .ndlw or .safetensors file (pickle .pkl is
-            not supported on the .NET port).
-          * --tokenizer should point to a SentencePiece .model file matching the
-            checkpoint.
-          * dump-compare reads a JSON spec and writes deterministic outputs
-            (tokenization, generation, retrieval embeddings) for diffing
-            against the Python reference.  See scripts/compare/README.md.
+        Commands:
+          parity      Compare this implementation against the JAX reference, stage
+                      by stage, using fixtures from
+                      scripts/parity/dump_reference.py.
+          cact-check  Compare this reader's dequantisation of a .cact deployment
+                      blob against the reference's own read_export, using the dump
+                      from scripts/parity/dump_cact.py.
+          info        Print the geometry, parameter count and KV budget.
+          run         Greedy-decode from raw token IDs with the KV-cached session.
+          bench       Time prefill and decode separately, and report weight
+                      storage, scratch high-water and bytes allocated per token.
+                      --profile adds a per-stage breakdown of the decode loop.
+          finetune    LoRA fine-tune on a JSONL dataset. The base stays frozen;
+                      only the adapters train, and they merge back at export.
 
-        For full documentation see README.md.
+        Weights may be a .cact blob, a directory holding weights.safetensors +
+        config.json, or a .safetensors file (pass --config alongside it).
+
+        A .cact blob runs on its packed Cactus-Quant weights by default; --dense
+        expands them to float32 instead.
         """;
 
     public static int Run(string[] args)
@@ -57,12 +65,14 @@ public static class CliEntry
         {
             return args[0] switch
             {
-                "run"          => RunInference(rest),
-                "eval"         => RunEval(rest),
-                "finetune"     => RunFinetune(rest),
-                "export"       => RunExport(rest),
-                "dump-compare" => RunDumpCompare(rest),
-                _ => UnknownCommand(args[0]),
+                "parity" => RunParity(rest),
+                "cact-check" => RunCactCheck(rest),
+                "info" => RunInfo(rest),
+                "run" => RunGenerate(rest),
+                "call" => RunCall(rest),
+                "bench" => RunBench(rest),
+                "finetune" => RunFinetune(rest),
+                _ => Unknown(args[0]),
             };
         }
         catch (Exception ex)
@@ -72,739 +82,415 @@ public static class CliEntry
         }
     }
 
-    private static int UnknownCommand(string cmd)
+    private static int Unknown(string command)
     {
-        Console.Error.WriteLine($"Unknown command: {cmd}");
+        Console.Error.WriteLine($"Unknown command: {command}");
         Console.Error.WriteLine(Help);
         return 2;
     }
 
-    // ── needle run ───────────────────────────────────────────────────────────
+    // ── parity ───────────────────────────────────────────────────────────────
 
-    private static int RunInference(string[] args)
+    private static int RunParity(string[] args)
     {
-        var opts = ArgParser.Parse(args);
-        string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
-        string query      = opts.Get("query", "What is the weather in San Francisco?");
-        string tools      = opts.Get("tools", """[{"name":"get_weather","parameters":{"location":"string"}}]""");
-        int maxLen        = int.Parse(opts.Get("max-len", "512"));
-        bool noConstrain  = opts.GetFlag("no-constrained");
+        var options = ArgParser.Parse(args);
+        string fixtures = options.Get("fixtures", "fixtures/parity");
+        float tolerance = float.Parse(options.Get("tolerance", "0.01"));
+        bool verbose = options.GetFlag("verbose");
 
-        var tokenizer = LoadTokenizer(tokPath);
-        var (model, config) = LoadModel(checkpoint);
+        if (!ParityHarness.IsAvailable(fixtures))
+        {
+            Console.Error.WriteLine($"No parity fixtures in '{fixtures}'.");
+            Console.Error.WriteLine("Generate them with:");
+            Console.Error.WriteLine($"  python3 scripts/parity/dump_reference.py --out {fixtures}");
+            return 1;
+        }
 
-        try
+        var stopwatch = Stopwatch.StartNew();
+        var model = ParityHarness.LoadModel(fixtures);
+        Console.WriteLine($"loaded {model.Weights.ParameterCount / 1e6:F1}M parameters "
+                          + $"in {stopwatch.ElapsedMilliseconds} ms");
+        Describe(model.Config);
+        Console.WriteLine();
+
+        bool allPassed = true;
+        foreach (string casePath in ParityHarness.CaseFiles(fixtures))
         {
-            using var runner = new InferenceRunner(model, tokenizer, config);
-            string result = runner.Generate(
-                query: query,
-                tools: tools,
-                maxGenLen: maxLen,
-                constrained: !noConstrain);
-            Console.WriteLine(result);
+            var report = ParityHarness.RunCase(model, casePath);
+            bool passed = report.Passed(tolerance);
+            allPassed &= passed;
+
+            Console.WriteLine($"case '{report.Case}': {(passed ? "PASS" : "FAIL")}  "
+                              + $"worst relative error {report.WorstRelative:G4}, "
+                              + $"argmax {report.ArgmaxMatches}/{report.ArgmaxTotal}, "
+                              + $"decode tokens {(report.DecodeTokensMatch ? "match" : "differ")}");
+
+            foreach (var delta in report.Deltas)
+                if (verbose || !delta.Within(tolerance))
+                    Console.WriteLine("  " + delta);
         }
-        finally
-        {
-            (model as IDisposable)?.Dispose();
-            tokenizer.Dispose();
-        }
-        return 0;
+
+        Console.WriteLine();
+        Console.WriteLine(allPassed
+            ? $"all cases within {tolerance:G3} relative error"
+            : $"one or more cases exceeded {tolerance:G3} relative error");
+        return allPassed ? 0 : 1;
     }
 
-    // ── needle eval ──────────────────────────────────────────────────────────
+    // ── cact-check ───────────────────────────────────────────────────────────
 
-    private static int RunEval(string[] args)
+    private static int RunCactCheck(string[] args)
     {
-        var opts = ArgParser.Parse(args);
-        string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
-        string jsonlPath  = opts.GetRequired("jsonl");
-        int maxGenLen     = int.Parse(opts.Get("max-gen-len", "512"));
-        int maxEncLen     = int.Parse(opts.Get("max-enc-len", "1024"));
-        bool noConstrain  = opts.GetFlag("no-constrained");
+        var options = ArgParser.Parse(args);
+        string cact = options.GetRequired("cact");
+        string expected = options.GetRequired("expected");
+        float tolerance = float.Parse(options.Get("tolerance", "1e-4"));
+        bool verbose = options.GetFlag("verbose");
 
-        var examples = JsonlDataset.Load(jsonlPath);
-        if (examples.Count == 0)
-            throw new InvalidOperationException($"No examples in {jsonlPath}");
+        var checks = CactCheck.Run(cact, expected);
+        var byWidth = new SortedDictionary<int, (int Count, float Worst)>();
 
-        var tokenizer = LoadTokenizer(tokPath);
-        var (model, config) = LoadModel(checkpoint);
-
-        try
+        foreach (var check in checks)
         {
-            using var runner = new InferenceRunner(model, tokenizer, config);
+            if (verbose)
+                Console.WriteLine($"  t{check.Index:D4} {check.Dtype,-9} bits={check.Bits,-2} "
+                                  + $"{string.Join("x", check.Shape),-16} {check.Delta}");
 
-            const int BATCH = 32;
-            var preds = new List<string>(examples.Count);
-            for (int i = 0; i < examples.Count; i += BATCH)
+            int width = check.Dtype == CactDtype.Quantized ? check.Bits : 0;
+            var entry = byWidth.GetValueOrDefault(width);
+            byWidth[width] = (entry.Count + 1, System.Math.Max(entry.Worst, check.Delta.MaxRelative));
+        }
+
+        Console.WriteLine($"compared {checks.Count} tensors from {Path.GetFileName(cact)}");
+        foreach (var (width, entry) in byWidth)
+        {
+            string label = width == 0 ? "fp16" : width == 5 ? "ternary" : $"CQ{width}";
+            Console.WriteLine($"  {label,-8} {entry.Count,4} tensors, worst relative error {entry.Worst:G4}");
+        }
+
+        float worst = checks.Count == 0 ? 0f : checks.Max(c => c.Delta.MaxRelative);
+        bool passed = worst <= tolerance;
+        Console.WriteLine(passed
+            ? $"all tensors within {tolerance:G3} relative error"
+            : $"worst relative error {worst:G4} exceeds {tolerance:G3}");
+
+        string tokenizerJson = Path.Combine(expected, "tokenizer.json");
+        if (File.Exists(tokenizerJson))
+        {
+            var tokenizer = CactTokenizer.FromCact(cact);
+            ChatMarkers.Validate(tokenizer);
+            var report = TokenizerCheck.Run(tokenizer, tokenizerJson);
+
+            Console.WriteLine($"tokenizer: {tokenizer.VocabSize} pieces, "
+                              + $"{report.Cases.Count(c => c.EncodeMatches && c.DecodeMatches)}"
+                              + $"/{report.Cases.Count} cases round-trip identically");
+            foreach (string mismatch in report.PieceMismatches)
+                Console.WriteLine("  piece mismatch: " + mismatch);
+            foreach (var result in report.Cases.Where(c => !c.EncodeMatches || !c.DecodeMatches))
             {
-                int end = System.Math.Min(i + BATCH, examples.Count);
-                var chunk = examples.GetRange(i, end - i);
-                preds.AddRange(runner.GenerateBatch(
-                    chunk.Select(e => e.Query).ToList(),
-                    chunk.Select(e => e.Tools).ToList(),
-                    maxGenLen: maxGenLen,
-                    maxEncLen: maxEncLen,
-                    constrained: !noConstrain));
+                Console.WriteLine($"  mismatch at token {result.FirstDivergence} for "
+                                  + $"{JsonSerializer.Serialize(result.Text)}");
+                Console.WriteLine($"    reference: [{string.Join(",", result.Expected)}] -> "
+                                  + JsonSerializer.Serialize(result.ExpectedDecoded));
+                Console.WriteLine($"    port:      [{string.Join(",", result.Actual)}] -> "
+                                  + JsonSerializer.Serialize(result.ActualDecoded));
             }
-
-            var m = ToolCallEvaluator.Evaluate(
-                examples.Select(e => e.Tools).ToList(),
-                examples.Select(e => e.Answers).ToList(),
-                preds);
-
-            Console.WriteLine($"  N            {m.N,12}");
-            Console.WriteLine($"  parse_rate   {m.ParseRate,12:P1}");
-            Console.WriteLine($"  exact_match  {m.ExactMatch,12:P1}");
-            Console.WriteLine($"  name_f1      {m.NameF1,12:P1}");
-            Console.WriteLine($"  call_f1      {m.CallF1,12:P1}");
-            Console.WriteLine($"  args_acc     {m.ArgsAcc,12:P1}");
-            Console.WriteLine($"  param_haluc  {m.ParamHaluc,12:P1}");
-            Console.WriteLine($"  param_miss   {m.ParamMiss,12:P1}");
-            Console.WriteLine($"  value_acc    {m.ValueAcc,12:P1}");
+            passed &= report.Passed;
         }
-        finally
+
+        return passed ? 0 : 1;
+    }
+
+    // ── info ─────────────────────────────────────────────────────────────────
+
+    private static int RunInfo(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        var model = LoadModel(options);
+        Describe(model.Config);
+        Console.WriteLine($"  parameters       {model.Weights.ParameterCount / 1e6:F2}M");
+        Console.WriteLine($"  weight storage   {model.Weights.ByteSize / 1e6:F1} MB "
+                          + $"({(model.Weights.IsQuantized ? "packed Cactus-Quant" : "float32")}, "
+                          + $"{model.Weights.ByteSize * 8.0 / model.Weights.ParameterCount:F2} bits/parameter)");
+        Console.WriteLine($"  heads present    "
+                          + $"mtp={(model.Weights.Mtp is not null ? "yes" : "no")} "
+                          + $"contrastive={(model.Weights.Contrastive is not null ? "yes" : "no")} "
+                          + $"confidence={(model.Weights.Confidence is not null ? "yes" : "no")}");
+        return 0;
+    }
+
+    private static void Describe(TransformerConfig config)
+    {
+        Console.WriteLine($"  vocab            {config.VocabSize}");
+        Console.WriteLine($"  d_model          {config.DModel} (attn {config.AttnWidth})");
+        Console.WriteLine($"  layers           {config.NumLayers}");
+        Console.WriteLine($"  heads            {config.NumHeads} q / {config.NumKvHeads} kv "
+                          + $"(head dim {config.HeadDim})");
+        Console.WriteLine($"  mhc lanes        {config.MhcLanes}");
+        Console.WriteLine($"  engram           sites [{string.Join(", ", config.EngramLayers)}], "
+                          + $"orders [{string.Join(", ", config.EngramOrders)}], "
+                          + $"{config.EngramSlots} slots x {config.EngramTables} tables");
+        Console.WriteLine($"  kv window        {KvBudget.EffectiveWindow(config)} "
+                          + $"(budget {KvBudget.BudgetWindow(config)}, configured {config.KvWindow})");
+    }
+
+    // ── run ──────────────────────────────────────────────────────────────────
+
+    private static int RunGenerate(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        var model = LoadModel(options);
+
+        var prompt = options.GetRequired("tokens")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(int.Parse)
+            .ToArray();
+        int maxNew = int.Parse(options.Get("max-new", "32"));
+
+        var session = new NeedleSession(model);
+        var stopwatch = Stopwatch.StartNew();
+        var generated = session.Generate(prompt, maxNew);
+        stopwatch.Stop();
+
+        Console.WriteLine(string.Join(",", generated));
+        Console.Error.WriteLine($"{generated.Count} tokens in {stopwatch.ElapsedMilliseconds} ms "
+                                + $"({generated.Count * 1000.0 / System.Math.Max(1, stopwatch.ElapsedMilliseconds):F1} tok/s)");
+        return 0;
+    }
+
+    // ── call ─────────────────────────────────────────────────────────────────
+
+    private static int RunCall(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        string weightsPath = options.GetRequired("weights");
+        var model = LoadModel(options);
+        var tokenizer = CactTokenizer.FromCact(weightsPath);
+
+        string tools = ReadInline(options.Get("tools", "[]"));
+        string query = options.GetRequired("query");
+        string? system = options.GetOrNull("system");
+        int maxNew = int.Parse(options.Get("max-new", "256"));
+
+        var agent = new NeedleAgent(model, tokenizer, tools, system);
+        var stopwatch = Stopwatch.StartNew();
+        var response = agent.Complete(query, maxNew);
+        stopwatch.Stop();
+
+        var payload = new JsonObject
         {
-            (model as IDisposable)?.Dispose();
-            tokenizer.Dispose();
+            ["type"] = response.Type,
+            ["success"] = response.Success,
+            ["error"] = response.Error,
+            ["function_calls"] = new JsonArray(response.FunctionCalls
+                .Select(c => (JsonNode)new JsonObject
+                {
+                    ["name"] = c.Name,
+                    ["arguments"] = c.Arguments.DeepClone(),
+                }).ToArray()),
+            ["reasoning"] = response.Reasoning,
+            ["confidence"] = System.Math.Round(response.Confidence, 4),
+            ["prompt_tokens"] = response.PromptTokens,
+            ["generated_tokens"] = response.GeneratedTokens,
+        };
+
+        Console.WriteLine(payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        Console.Error.WriteLine(
+            $"{response.PromptTokens} prompt + {response.GeneratedTokens} generated tokens "
+            + $"in {stopwatch.ElapsedMilliseconds} ms");
+        if (options.GetFlag("raw")) Console.Error.WriteLine("raw: " + response.Text);
+        return 0;
+    }
+
+    /// <summary>Reads a value that may be given inline or as <c>@path</c>.</summary>
+    private static string ReadInline(string value) =>
+        value.StartsWith('@') ? File.ReadAllText(value[1..]) : value;
+
+    // ── bench ────────────────────────────────────────────────────────────────
+
+    private static int RunBench(string[] args)
+    {
+        var options = ArgParser.Parse(args);
+        var model = LoadModel(options);
+        int promptLength = int.Parse(options.Get("prompt", "128"));
+        int decodeSteps = int.Parse(options.Get("decode", "64"));
+
+        var prompt = new int[promptLength];
+        prompt[0] = 2;
+        for (int i = 1; i < promptLength; i++) prompt[i] = (i * 37 + 11) % 8000 + 1;
+
+        // Tiered JIT promotes a method after roughly thirty calls and needs
+        // on-stack replacement for the long loops, so warm up on the real
+        // shapes — a token or two of warm-up measures the interpreter.
+        int warmupSteps = System.Math.Max(40, decodeSteps / 2);
+        var warmup = new NeedleSession(model, capacity: promptLength + warmupSteps + 8);
+        warmup.Generate(prompt, maxNewTokens: warmupSteps);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        var session = new NeedleSession(model, capacity: promptLength + decodeSteps + 8);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        var prefill = Stopwatch.StartNew();
+        var logits = session.Advance(prompt);
+        prefill.Stop();
+        long prefillBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        // Stage probes are charged to decode only: prefill and decode have
+        // different shapes and averaging them together hides both.
+        var profiler = options.GetFlag("profile") ? new StageProfiler() : null;
+        model.Profiler = profiler;
+        profiler?.StartWall();
+
+        before = GC.GetAllocatedBytesForCurrentThread();
+        int gcBefore = GC.CollectionCount(0) + GC.CollectionCount(1) + GC.CollectionCount(2);
+        var decode = Stopwatch.StartNew();
+        for (int i = 0; i < decodeSteps; i++)
+            logits = session.Advance(Ops.ArgMax(logits.ReadSpan));
+        decode.Stop();
+        int collections = GC.CollectionCount(0) + GC.CollectionCount(1) + GC.CollectionCount(2) - gcBefore;
+        long decodeBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+        profiler?.StopWall();
+        model.Profiler = null;
+
+        // Which vector width the kernels actually got decides how these numbers
+        // read, and it is not simply "whatever the CPU supports": .NET keeps
+        // Vector<T> at 256 bits on AVX-512 hardware unless asked otherwise.
+        Console.WriteLine($"simd             Vector<float> {System.Numerics.Vector<float>.Count} wide, "
+                          + $"Vector256 {(System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated ? "yes" : "no")}, "
+                          + $"Vector512 {(System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated ? "yes" : "no")}, "
+                          + $"{Environment.ProcessorCount} cores");
+        Console.WriteLine($"weights          {model.Weights.ByteSize / 1e6:F1} MB "
+                          + $"({(model.Weights.IsQuantized ? "packed Cactus-Quant" : "float32")})");
+        Console.WriteLine($"scratch arena    {model.ScratchHighWater * 4 / 1e6:F2} MB high water");
+        Console.WriteLine($"prefill          {promptLength} tokens in {prefill.Elapsed.TotalMilliseconds:F0} ms "
+                          + $"({promptLength * 1000.0 / prefill.Elapsed.TotalMilliseconds:F0} tok/s), "
+                          + $"{prefillBytes / 1024.0:F0} KB allocated");
+        Console.WriteLine($"decode           {decodeSteps} tokens in {decode.Elapsed.TotalMilliseconds:F0} ms "
+                          + $"({decodeSteps * 1000.0 / decode.Elapsed.TotalMilliseconds:F1} tok/s), "
+                          + $"{decodeBytes / (double)decodeSteps / 1024.0:F1} KB allocated per token");
+        Console.WriteLine($"collections      {collections} across all generations during decode");
+
+        if (profiler is not null)
+        {
+            Console.WriteLine();
+            Console.WriteLine(profiler.Report(decodeSteps));
         }
         return 0;
     }
 
-    // ── needle finetune ──────────────────────────────────────────────────────
+    // ── finetune ─────────────────────────────────────────────────────────────
 
     private static int RunFinetune(string[] args)
     {
-        var opts = ArgParser.Parse(args);
-        string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
-        string jsonlPath  = opts.GetRequired("jsonl");
-        int epochs        = int.Parse(opts.Get("epochs",     "1"));
-        int batchSize     = int.Parse(opts.Get("batch-size", "8"));
-        string ckptDir    = opts.Get("checkpoint-dir", "checkpoints");
-        string expName    = opts.Get("name", "needle_finetuned");
+        var options = ArgParser.Parse(args);
+        string weightsPath = options.GetRequired("weights");
+        string dataPath = options.GetRequired("data");
+        string outPath = options.Get("out", "needle_lora.safetensors");
 
-        var tokenizer = LoadTokenizer(tokPath);
-        var (model, config) = LoadModel(checkpoint);
+        var config = new FinetuneConfig(
+            Epochs: int.Parse(options.Get("epochs", "3")),
+            LearningRate: float.Parse(options.Get("lr", "1e-4")),
+            Rank: int.Parse(options.Get("rank", "16")),
+            Alpha: float.Parse(options.Get("alpha", "32")),
+            MaxLength: int.Parse(options.Get("max-len", "128")),
+            BatchSize: int.Parse(options.Get("batch-size", "4")),
+            Window: int.Parse(options.Get("window", "0")),
+            Seed: int.Parse(options.Get("seed", "0")));
 
-        try
+        // Training multiplies by the base weights from both sides, so it wants
+        // them expanded regardless of how the blob is stored.
+        var loaded = CactLayout.Load(weightsPath);
+        var weights = Needle2Weights.FromFlat(loaded.Config, loaded.Parameters);
+        var tokenizer = CactTokenizer.FromCact(weightsPath);
+
+        var examples = JsonlDataset.Load(dataPath);
+        if (examples.Count == 0)
         {
-            var ftConfig = new JsonlFinetuneConfig
-            {
-                Epochs         = epochs,
-                BatchSize      = batchSize,
-                CheckpointDir  = ckptDir,
-                ExperimentName = expName,
-            };
-
-            var finetuner = new JsonlFinetuner(model, config, tokenizer, ftConfig);
-            var result    = finetuner.Run(jsonlPath);
-
-            Console.WriteLine();
-            Console.WriteLine("─── Result ──────────────");
-            if (result.BaseMetrics is not null)
-                Console.WriteLine($"  base call_f1       {result.BaseMetrics.CallF1,12:P1}");
-            if (result.FinetunedMetrics is not null)
-                Console.WriteLine($"  finetuned call_f1  {result.FinetunedMetrics.CallF1,12:P1}");
-            Console.WriteLine($"  best checkpoint:   {result.BestCheckpointPath}");
-        }
-        finally
-        {
-            (model as IDisposable)?.Dispose();
-            tokenizer.Dispose();
-        }
-        return 0;
-    }
-
-    // ── needle export ────────────────────────────────────────────────────────
-
-    private static int RunExport(string[] args)
-    {
-        var opts = ArgParser.Parse(args);
-        string checkpoint = opts.GetRequired("checkpoint");
-        int factor        = int.Parse(opts.GetRequired("factor"));
-        string output     = opts.GetRequired("output");
-
-        var (_, tensors) = WeightLoader.Load(checkpoint);
-
-        try
-        {
-            // Infer config dimensions from the embedding tensor.
-            if (!tensors.TryGetValue("embedding.weight", out var embed))
-                throw new InvalidOperationException(
-                    "Checkpoint missing 'embedding.weight' — cannot infer config.");
-
-            int vocabSize = (int)embed.shape[0];
-            int dModel    = (int)embed.shape[1];
-
-            int dFf = InferDFf(tensors);
-            var config = new TransformerConfig { VocabSize = vocabSize, DModel = dModel, DFf = dFf };
-
-            var (sliced, newConfig) = SubmodelExport.SliceParams(tensors, config, factor);
-            try
-            {
-                WeightLoader.Save(sliced, output);
-                Console.WriteLine($"Exported to {output} (dFf {config.DFf} → {newConfig.DFf})");
-            }
-            finally
-            {
-                foreach (var t in sliced.Values) t.Dispose();
-            }
-        }
-        finally
-        {
-            foreach (var t in tensors.Values) t.Dispose();
-        }
-        return 0;
-    }
-
-    private static int InferDFf(IReadOnlyDictionary<string, Tensor> tensors)
-    {
-        foreach (var (name, t) in tensors)
-        {
-            if (name.Contains("gate_proj.weight", StringComparison.Ordinal) && t.dim() >= 2)
-                return (int)t.shape[^1];
-        }
-        throw new InvalidOperationException(
-            "Could not infer DFf — no gate_proj.weight tensor found in checkpoint.");
-    }
-
-    // ── needle dump-compare ──────────────────────────────────────────────────
-
-    /// <summary>
-    /// Read a JSON spec describing test inputs (tokenization, generation,
-    /// retrieval) and write a deterministic JSON dump of the C# outputs, for
-    /// numerical diffing against the Python reference.  See
-    /// scripts/compare/README.md.
-    /// </summary>
-    private static int RunDumpCompare(string[] args)
-    {
-        var opts = ArgParser.Parse(args);
-        string checkpoint = opts.GetRequired("checkpoint");
-        string tokPath    = opts.GetRequired("tokenizer");
-        string specPath   = opts.GetRequired("spec");
-        string outPath    = opts.GetRequired("out");
-        int floatPrec     = int.Parse(opts.Get("float-precision", "8"));
-
-        if (!File.Exists(specPath))
-            throw new FileNotFoundException($"Spec file not found: {specPath}", specPath);
-
-        var specRoot = JsonNode.Parse(File.ReadAllText(specPath))
-            ?? throw new InvalidOperationException("Empty or invalid spec JSON.");
-
-        var tokenizer = LoadTokenizer(tokPath);
-        var output    = new JsonObject();
-
-        // ── Tokenization tests ──────────────────────────────────────────────
-        if (specRoot["tokenize"] is JsonArray tokSpec)
-        {
-            var outArr = new JsonArray();
-            foreach (var item in tokSpec)
-            {
-                string text = item?["text"]?.GetValue<string>()
-                              ?? throw new InvalidOperationException("tokenize.text missing");
-                var ids   = tokenizer.Encode(text);
-                var entry = new JsonObject
-                {
-                    ["text"]    = text,
-                    ["ids"]     = new JsonArray([.. ids.Select(i => JsonValue.Create(i))]),
-                    ["decoded"] = tokenizer.Decode(ids),
-                };
-                outArr.Add(entry);
-            }
-            output["tokenize"] = outArr;
+            Console.Error.WriteLine($"No usable examples in '{dataPath}'.");
+            return 1;
         }
 
-        // ── Tool-name normalization (pure-function check, no model) ─────────
-        if (specRoot["tool_normalize"] is JsonArray normSpec)
+        var (train, validation, _) = options.GetFlag("eval")
+            ? JsonlDataset.PerToolSplit(examples)
+            : (examples, [], []);
+
+        var finetuner = new Finetuner(weights, tokenizer, config);
+        Console.WriteLine($"{train.Count} training examples"
+                          + (validation.Count > 0 ? $", {validation.Count} held out" : "")
+                          + $"; LoRA rank {config.Rank} on {finetuner.Adapters.Adapters.Count} projections "
+                          + $"({finetuner.Adapters.ParameterCount / 1e6:F2}M trainable of "
+                          + $"{weights.ParameterCount / 1e6:F1}M)");
+
+        // Per-step times are reported below, so the training path has to be at
+        // tier 1 before the first one — otherwise step 1 is a JIT measurement.
+        var warmupClock = Stopwatch.StartNew();
+        finetuner.Warmup(train);
+        Console.WriteLine($"warmed the training path in {warmupClock.Elapsed.TotalSeconds:F1}s");
+
+        // Per-step losses are different examples, so they say little on their own.
+        // Measure a fixed set before and after instead.
+        var probe = validation.Count > 0 ? validation : train;
+        string probeName = validation.Count > 0 ? "held-out" : "training-set";
+        Console.WriteLine($"{probeName} loss before: {finetuner.Evaluate(probe):F4}");
+
+        var history = finetuner.Run(train, step =>
         {
-            var outArr = new JsonArray();
-            foreach (var item in normSpec)
-            {
-                string input = item?.GetValue<string>() ?? "";
-                var (normalized, nameMap) = ToolNormalizer.NormalizeTools(input);
-                var mapObj = new JsonObject();
-                foreach (var (snake, orig) in nameMap)
-                    mapObj[snake] = orig;
-                outArr.Add(new JsonObject
-                {
-                    ["input"]    = input,
-                    ["tools"]    = normalized,
-                    ["name_map"] = mapObj,
-                });
-            }
-            output["tool_normalize"] = outArr;
-        }
+            if (step.Step == 1 || step.Step % 5 == 0)
+                Console.WriteLine($"  epoch {step.Epoch} step {step.Step}: loss {step.Loss:F4}, "
+                                  + $"grad norm {step.GradientNorm:F3}, lr {step.LearningRate:G3}, "
+                                  + $"{step.Elapsed.TotalSeconds:F1}s");
+        });
 
-        // Generation, retrieval, forward-loss, and quantize all need the
-        // model; skip loading if none are requested (tokenizer-only diffs
-        // don't need weights).
-        bool needsModel =
-            specRoot["generate"]         is JsonArray  ||
-            specRoot["generate_batch"]   is JsonArray  ||
-            specRoot["encode_retrieval"] is JsonObject ||
-            specRoot["forward_loss"]     is JsonObject ||
-            specRoot["quantize"]         is JsonObject;
+        if (history.Count > 0)
+            Console.WriteLine($"loss {history[0].Loss:F4} -> {history[^1].Loss:F4} "
+                              + $"over {history.Count} steps");
+        Console.WriteLine($"{probeName} loss after:  {finetuner.Evaluate(probe):F4}");
 
-        if (needsModel)
-        {
-            var (model, config) = LoadModel(checkpoint);
-            try
-            {
-                using var runner = new InferenceRunner(model, tokenizer, config);
+        // The tape retains every intermediate for the backward pass, so training
+        // is the one flow whose footprint scales with sequence length. Report it
+        // rather than leave it to be discovered.
+        using (var self = System.Diagnostics.Process.GetCurrentProcess())
+            Console.WriteLine($"peak working set: {self.PeakWorkingSet64 / 1e6:F0} MB");
 
-                // ── Generation tests ─────────────────────────────────────────
-                if (specRoot["generate"] is JsonArray genSpec)
-                {
-                    var outArr = new JsonArray();
-                    foreach (var item in genSpec)
-                    {
-                        if (item is not JsonObject obj)
-                            throw new InvalidOperationException("generate items must be objects.");
-
-                        string id          = obj["id"]?.GetValue<string>() ?? "";
-                        string query       = obj["query"]?.GetValue<string>()
-                                              ?? throw new InvalidOperationException("generate.query missing");
-                        string tools       = obj["tools"]?.GetValue<string>() ?? "[]";
-                        int    maxGen      = obj["max_gen_len"]?.GetValue<int>() ?? 128;
-                        int    maxEnc      = obj["max_enc_len"]?.GetValue<int>() ?? 1024;
-                        bool   constrained = obj["constrained"]?.GetValue<bool>() ?? false;
-                        bool   normalize   = obj["normalize"]?.GetValue<bool>() ?? false;
-
-                        // Capture the actual generated token IDs (in addition
-                        // to the decoded text), so the comparator can diff
-                        // them deterministically.
-                        var pieces = new List<string>();
-                        IProgress<string> sink = new Progress<string>(p => pieces.Add(p));
-
-                        string text = runner.Generate(
-                            query:      query,
-                            tools:      tools,
-                            maxGenLen:  maxGen,
-                            maxEncLen:  maxEnc,
-                            normalize:  normalize,
-                            constrained: constrained,
-                            progress:   sink);
-
-                        // Re-encode the produced text to get the canonical ID
-                        // list (mirrors what the Python comparator can produce).
-                        var producedIds = tokenizer.Encode(text);
-
-                        var entry = new JsonObject
-                        {
-                            ["id"]     = id,
-                            ["query"]  = query,
-                            ["text"]   = text,
-                            ["ids"]    = new JsonArray([.. producedIds.Select(i => JsonValue.Create(i))]),
-                            ["pieces"] = new JsonArray([.. pieces.Select(p => JsonValue.Create(p))]),
-                        };
-                        outArr.Add(entry);
-                    }
-                    output["generate"] = outArr;
-                }
-
-                // ── Batched generation ───────────────────────────────────────
-                if (specRoot["generate_batch"] is JsonArray gbSpec)
-                {
-                    var outArr = new JsonArray();
-                    foreach (var entry in gbSpec)
-                    {
-                        if (entry is not JsonObject obj)
-                            throw new InvalidOperationException("generate_batch items must be objects.");
-                        string id      = obj["id"]?.GetValue<string>() ?? "";
-                        var items      = (obj["items"] as JsonArray)
-                                          ?? throw new InvalidOperationException("generate_batch.items missing");
-                        int maxGen     = obj["max_gen_len"]?.GetValue<int>() ?? 128;
-                        int maxEnc     = obj["max_enc_len"]?.GetValue<int>() ?? 1024;
-                        bool constrained = obj["constrained"]?.GetValue<bool>() ?? false;
-                        bool normalize   = obj["normalize"]?.GetValue<bool>() ?? false;
-
-                        var queries = items.Select(it => it?["query"]?.GetValue<string>() ?? "").ToList();
-                        var tools   = items.Select(it => it?["tools"]?.GetValue<string>() ?? "[]").ToList();
-
-                        var preds = runner.GenerateBatch(
-                            queries, tools,
-                            maxGenLen: maxGen,
-                            maxEncLen: maxEnc,
-                            normalize: normalize,
-                            constrained: constrained);
-
-                        var results = new JsonArray();
-                        for (int k = 0; k < queries.Count; k++)
-                        {
-                            var ids = tokenizer.Encode(preds[k]);
-                            results.Add(new JsonObject
-                            {
-                                ["query"] = queries[k],
-                                ["tools"] = tools[k],
-                                ["text"]  = preds[k],
-                                ["ids"]   = new JsonArray([.. ids.Select(i => JsonValue.Create(i))]),
-                            });
-                        }
-                        outArr.Add(new JsonObject { ["id"] = id, ["results"] = results });
-                    }
-                    output["generate_batch"] = outArr;
-                }
-
-                // ── Retrieval-embedding tests ────────────────────────────────
-                if (specRoot["encode_retrieval"] is JsonObject retSpec)
-                {
-                    int maxLen = retSpec["max_len"]?.GetValue<int>() ?? 256;
-                    var texts  = (retSpec["texts"] as JsonArray)
-                                 ?? throw new InvalidOperationException("encode_retrieval.texts missing");
-                    var textList = texts.Select(t => t?.GetValue<string>() ?? "").ToList();
-
-                    float[,] embs = runner.EncodeForRetrieval(textList, maxLen: maxLen);
-                    int N = embs.GetLength(0);
-                    int D = embs.GetLength(1);
-
-                    var embArr = new JsonArray();
-                    string fmt = $"F{floatPrec}";
-                    for (int i = 0; i < N; i++)
-                    {
-                        var row = new JsonArray();
-                        for (int j = 0; j < D; j++)
-                            row.Add(JsonValue.Create(SafeRound(embs[i, j], floatPrec)));
-                        embArr.Add(row);
-                    }
-
-                    output["encode_retrieval"] = new JsonObject
-                    {
-                        ["shape"]      = new JsonArray(N, D),
-                        ["texts"]      = new JsonArray([.. textList.Select(t => JsonValue.Create(t))]),
-                        ["embeddings"] = embArr,
-                    };
-                }
-
-                // ── Forward + loss (training-math parity) ────────────────────
-                if (specRoot["forward_loss"] is JsonObject flSpec)
-                {
-                    var (lossOut, _) = DumpForwardLoss(model, flSpec, floatPrec);
-                    output["forward_loss"] = lossOut;
-                }
-
-                // ── Quantization parity ──────────────────────────────────────
-                if (specRoot["quantize"] is JsonObject qSpec)
-                {
-                    output["quantize"] = DumpQuantize(model, qSpec, floatPrec);
-                }
-            }
-            finally
-            {
-                (model as IDisposable)?.Dispose();
-            }
-        }
-
-        // Header so the comparator can sanity-check the side it's reading.
-        output["meta"] = new JsonObject
-        {
-            ["side"]            = "csharp",
-            ["checkpoint"]      = checkpoint,
-            ["tokenizer"]       = tokPath,
-            ["float_precision"] = floatPrec,
-        };
-
-        tokenizer.Dispose();
-
-        var serializerOpts = new JsonSerializerOptions
-        {
-            WriteIndented = true,
-            Encoder       = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        };
-        File.WriteAllText(outPath, output.ToJsonString(serializerOpts));
+        finetuner.Adapters.Save(outPath);
         Console.WriteLine($"wrote {outPath}");
         return 0;
     }
 
-    /// <summary>
-    /// Round a float for JSON output, replacing non-finite values with 0 so
-    /// JsonValue.Create doesn't throw on Inf/NaN.  Drift from the Python side
-    /// will surface as a tolerance failure in the comparator.
-    /// </summary>
-    private static double SafeRound(double v, int digits)
+    // ── shared ───────────────────────────────────────────────────────────────
+
+    private static Needle2Model LoadModel(ArgParser options)
     {
-        if (double.IsNaN(v) || double.IsInfinity(v)) return 0.0;
-        return System.Math.Round(v, digits);
-    }
+        string weights = options.GetRequired("weights");
 
-    // ── Forward-loss dump (training-math parity) ──────────────────────────────
+        if (Directory.Exists(weights)) return ParityHarness.LoadModel(weights);
 
-    private static (JsonObject Result, Tensor Logits) DumpForwardLoss(
-        SimpleAttentionNetwork model,
-        JsonObject spec,
-        int floatPrec)
-    {
-        model.eval();
-        using var noGrad = torch.no_grad();
-
-        long[,] LoadInts(string key)
+        if (weights.EndsWith(".cact", StringComparison.OrdinalIgnoreCase))
         {
-            var rows = spec[key] as JsonArray
-                ?? throw new InvalidOperationException($"forward_loss.{key} missing");
-            int B = rows.Count;
-            int T = (rows[0] as JsonArray)?.Count ?? 0;
-            var arr = new long[B, T];
-            for (int b = 0; b < B; b++)
+            var template = options.GetOrNull("config") is { } configFile
+                ? CheckpointConfig.Load(configFile)
+                : new TransformerConfig();
+
+            // Packed by default: the weights stay at two bits each and
+            // dequantisation folds into the matmul. --dense expands them to
+            // float32 instead, which is what the training flow wants.
+            if (options.GetFlag("dense"))
             {
-                var r = rows[b] as JsonArray
-                    ?? throw new InvalidOperationException($"forward_loss.{key}[{b}] not array");
-                for (int t = 0; t < T; t++) arr[b, t] = r[t]?.GetValue<long>() ?? 0L;
+                var expanded = CactLayout.Load(weights, template);
+                return new Needle2Model(Needle2Weights.FromFlat(expanded.Config, expanded.Parameters));
             }
-            return arr;
+            return new Needle2Model(CactWeights.Load(weights, template).Weights);
         }
 
-        long[,] src    = LoadInts("src_tokens");
-        long[,] tgtIn  = LoadInts("tgt_in_tokens");
-        long[,] tgtOut = LoadInts("tgt_out_tokens");
-        long[,] lossM  = LoadInts("loss_mask");
-        long[,] encSeg = LoadInts("enc_seg_ids");
-        long[,] decSeg = LoadInts("dec_seg_ids");
+        string configPath = options.GetOrNull("config")
+            ?? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(weights)) ?? ".", "config.json");
+        if (!File.Exists(configPath))
+            throw new FileNotFoundException(
+                $"No config found for '{weights}'. Pass --config <path>.", configPath);
 
-        long B = src.GetLength(0);
-        long Te = src.GetLength(1);
-        long Td = tgtIn.GetLength(1);
-
-        using var srcT    = torch.tensor(src.Cast<long>().ToArray(),    new long[] { B, Te });
-        using var tgtInT  = torch.tensor(tgtIn.Cast<long>().ToArray(),  new long[] { B, Td });
-        using var tgtOutT = torch.tensor(tgtOut.Cast<long>().ToArray(), new long[] { B, Td });
-
-        // The training mask helpers expect int32 segment IDs.
-        using var encSegT = torch.tensor(encSeg.Cast<long>().Select(x => (int)x).ToArray(),
-                                         new long[] { B, Te }, dtype: ScalarType.Int32);
-        using var decSegT = torch.tensor(decSeg.Cast<long>().Select(x => (int)x).ToArray(),
-                                         new long[] { B, Td }, dtype: ScalarType.Int32);
-        using var lossMT  = torch.tensor(lossM.Cast<long>().Select(x => (int)x).ToArray(),
-                                         new long[] { B, Td }, dtype: ScalarType.Int32);
-
-        using var srcMask   = MaskUtils.MakePackingMask(encSegT);
-        using var tgtMask   = MaskUtils.MakeCausalPackingMask(decSegT);
-        using var crossMask = MaskUtils.MakeCrossPackingMask(encSegT, decSegT);
-
-        var logits = model.Forward(srcT, tgtInT, srcMask, tgtMask, crossMask);
-
-        // Token-class weights match the trainer defaults (base, name, value, key).
-        var weightMap = LossFunctions.DefaultTokenWeightMap;
-        using var tokenWeights = LossFunctions.BuildTokenWeights(lossMT, weightMap);
-        using var textLoss     = LossFunctions.TextLoss(logits, tgtOutT, tokenWeights, decSegT);
-        using var zLoss        = LossFunctions.ZLoss(logits);
-        using var totalLoss    = textLoss + zLoss;
-
-        float ce = textLoss.item<float>();
-        float zl = zLoss.item<float>();
-
-        // Probe: first 8 vocab logits at every (batch, position).  Lets the
-        // comparator diff numerically rather than just a single scalar.
-        long V = logits.shape[2];
-        long probeWidth = System.Math.Min(8L, V);
-        using var probeT = logits.index(TensorIndex.Ellipsis,
-                                       TensorIndex.Slice(stop: probeWidth));
-        var flat = probeT.to(ScalarType.Float32).contiguous().data<float>().ToArray();
-        var probe = new JsonArray();
-        for (long b = 0; b < B; b++)
-        {
-            for (long t = 0; t < Td; t++)
-            {
-                var row = new JsonArray();
-                long baseIdx = (b * Td + t) * probeWidth;
-                for (long k = 0; k < probeWidth; k++)
-                    row.Add(JsonValue.Create(SafeRound(flat[baseIdx + k], floatPrec)));
-                probe.Add(row);
-            }
-        }
-
-        var result = new JsonObject
-        {
-            ["shape"]        = new JsonArray(B, Td, V),
-            ["ce_loss"]      = JsonValue.Create(SafeRound((double)ce,      floatPrec)),
-            ["z_loss"]       = JsonValue.Create(SafeRound((double)zl,      floatPrec)),
-            ["total_loss"]   = JsonValue.Create(SafeRound((double)(ce + zl), floatPrec)),
-            ["logits_probe"] = probe,
-        };
-        return (result, logits);
-    }
-
-    // ── Quantization dump ─────────────────────────────────────────────────────
-
-    private static JsonObject DumpQuantize(
-        SimpleAttentionNetwork model,
-        JsonObject spec,
-        int floatPrec)
-    {
-        string key   = spec["tensor_key"]?.GetValue<string>()
-                       ?? throw new InvalidOperationException("quantize.tensor_key missing");
-        var rows = spec["rows"] as JsonArray;
-        var cols = spec["cols"] as JsonArray;
-        int r0 = rows?[0]?.GetValue<int>() ?? 0;
-        int r1 = rows?[1]?.GetValue<int>() ?? 32;
-        int c0 = cols?[0]?.GetValue<int>() ?? 0;
-        int c1 = cols?[1]?.GetValue<int>() ?? 32;
-        int gs = spec["group_size"]?.GetValue<int>() ?? 32;
-        string prec = spec["precision"]?.GetValue<string>() ?? "int4";
-
-        using var noGrad = torch.no_grad();
-
-        // Find the parameter by name.
-        Tensor? tensor = null;
-        foreach (var (name, p) in model.named_parameters())
-        {
-            if (name == key) { tensor = p; break; }
-        }
-        if (tensor is null)
-            throw new InvalidOperationException($"quantize: parameter '{key}' not in model.");
-
-        using var sub = tensor[TensorIndex.Slice(r0, r1), TensorIndex.Slice(c0, c1)]
-                        .to(ScalarType.Float32)
-                        .contiguous();
-
-        using var quant = prec == "int8"
-            ? Quantize.FakeQuantizeInt8(sub, gs)
-            : Quantize.FakeQuantizeInt4(sub, gs);
-
-        int H = (int)quant.shape[0], W = (int)quant.shape[1];
-        var flat = quant.to(ScalarType.Float32).contiguous().data<float>().ToArray();
-        var values = new JsonArray();
-        for (int i = 0; i < H; i++)
-        {
-            var row = new JsonArray();
-            for (int j = 0; j < W; j++)
-                row.Add(JsonValue.Create(SafeRound(flat[i * W + j], floatPrec)));
-            values.Add(row);
-        }
-
-        return new JsonObject
-        {
-            ["tensor_key"] = key,
-            ["rows"]       = new JsonArray(r0, r1),
-            ["cols"]       = new JsonArray(c0, c1),
-            ["group_size"] = gs,
-            ["precision"]  = prec,
-            ["shape"]      = new JsonArray(H, W),
-            ["values"]     = values,
-        };
-    }
-
-    // ── Loading helpers ──────────────────────────────────────────────────────
-
-    private static NeedleTokenizer LoadTokenizer(string path)
-    {
-        if (!File.Exists(path))
-            throw new FileNotFoundException($"Tokenizer model not found: {path}", path);
-        return new NeedleTokenizer(path);
-    }
-
-    private static (SimpleAttentionNetwork model, TransformerConfig config) LoadModel(string path)
-    {
-        // Decide format by extension or by checking the magic header.
-        Dictionary<string, Tensor> tensors;
-        if (path.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
-            (_, tensors) = WeightLoader.LoadSafetensors(path);
-        else
-            (_, tensors) = WeightLoader.Load(path);
-
-        try
-        {
-            if (!tensors.TryGetValue("embedding.weight", out var embed))
-                throw new InvalidOperationException(
-                    "Checkpoint missing 'embedding.weight' — cannot infer config.");
-
-            int vocabSize = (int)embed.shape[0];
-            int dModel    = (int)embed.shape[1];
-
-            var config = new TransformerConfig
-            {
-                VocabSize        = vocabSize,
-                DModel           = dModel,
-                NumHeads         = InferNumHeads(dModel),
-                NumKvHeads       = InferNumHeads(dModel) / 2,
-                NumEncoderLayers = CountLayers(tensors, "encoder"),
-                NumDecoderLayers = CountLayers(tensors, "decoder"),
-                DFf              = TryInferDFf(tensors) ?? dModel * 4,
-                MaxSeqLen        = 1024,
-                ContrastiveDim   = 128,
-                NoFeedforward    = !tensors.Keys.Any(k => k.Contains("gate_proj")),
-            };
-
-            var model = new SimpleAttentionNetwork(config);
-            // Best-effort weight transfer.  Unknown keys are silently skipped;
-            // mismatched shapes log a warning.
-            LoadIntoModel(model, tensors);
-            return (model, config);
-        }
-        finally
-        {
-            foreach (var t in tensors.Values) t.Dispose();
-        }
-    }
-
-    private static int InferNumHeads(int dModel)
-    {
-        // The published config uses 8 heads for d=512.  Fall back to a sensible
-        // divisor of dModel.
-        if (dModel % 8 == 0) return 8;
-        if (dModel % 4 == 0) return 4;
-        if (dModel % 2 == 0) return 2;
-        return 1;
-    }
-
-    private static int CountLayers(IReadOnlyDictionary<string, Tensor> tensors, string stack)
-    {
-        // Accept both the historical `<stack>.layer_<n>` naming and the
-        // TorchSharp ModuleList naming `<stack>._layers.<n>` that the actual
-        // model emits via named_parameters().
-        string[] prefixes = [$"{stack}._layers.", $"{stack}.layer_"];
-        int max = -1;
-        foreach (var name in tensors.Keys)
-        {
-            foreach (var prefix in prefixes)
-            {
-                int idx = name.IndexOf(prefix, StringComparison.Ordinal);
-                if (idx < 0) continue;
-                int start = idx + prefix.Length;
-                int end   = start;
-                while (end < name.Length && char.IsDigit(name[end])) end++;
-                if (end > start && int.TryParse(name.AsSpan(start, end - start), out int n))
-                    if (n > max) max = n;
-                break;
-            }
-        }
-        return System.Math.Max(1, max + 1);
-    }
-
-    private static int? TryInferDFf(IReadOnlyDictionary<string, Tensor> tensors)
-    {
-        foreach (var (name, t) in tensors)
-        {
-            if (name.Contains("gate_proj.weight", StringComparison.Ordinal) && t.dim() >= 2)
-                return (int)t.shape[^1];
-        }
-        return null;
-    }
-
-    private static void LoadIntoModel(SimpleAttentionNetwork model, IReadOnlyDictionary<string, Tensor> tensors)
-    {
-        var loaded = 0;
-        var skipped = 0;
-        var modelParams = model.named_parameters().ToDictionary(p => p.name, p => p.parameter);
-
-        using var noGrad = torch.no_grad();
-        foreach (var (name, src) in tensors)
-        {
-            if (!modelParams.TryGetValue(name, out var dst))
-            {
-                skipped++;
-                continue;
-            }
-            if (!src.shape.SequenceEqual(dst.shape))
-            {
-                Console.Error.WriteLine($"  shape mismatch for {name}: ckpt={string.Join('x', src.shape)} model={string.Join('x', dst.shape)}");
-                skipped++;
-                continue;
-            }
-            dst.copy_(src.to(dst.dtype));
-            loaded++;
-        }
-
-        Console.WriteLine($"  loaded {loaded} tensor(s), skipped {skipped}");
+        var config = CheckpointConfig.Load(configPath);
+        var flat = Safetensors.Load(weights);
+        return new Needle2Model(Needle2Weights.FromFlat(config, flat));
     }
 }
