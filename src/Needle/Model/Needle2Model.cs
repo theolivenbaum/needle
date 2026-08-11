@@ -185,7 +185,7 @@ public sealed class Needle2Model
         ITrace? trace = null)
     {
         int seqLen = tokens.Length;
-        long mark = StageProfiler.Mark(Profiler);
+        var mark = StageProfiler.Mark(Profiler);
         var x0 = Embed(tokens);
         StageProfiler.Add(Profiler, Stage.Embed, mark);
         trace?.Record("embed", x0);
@@ -246,7 +246,7 @@ public sealed class Needle2Model
         var m = _w.Mhc[layer];
 
         // nx = rms_unit(x.reshape(T, lanes*D)) — the shared read of every lane.
-        long mark = StageProfiler.Mark(Profiler);
+        var mark = StageProfiler.Mark(Profiler);
         var nx = scratch.Take(seqLen, lanes * d);
         stack.Lanes.ReadSpan.CopyTo(nx.Span);
         Ops.RmsUnit(nx);
@@ -362,7 +362,7 @@ public sealed class Needle2Model
         int seqLen = x.Length / d;
         scratch ??= _scratch;
 
-        long mark = StageProfiler.Mark(Profiler);
+        var mark = StageProfiler.Mark(Profiler);
         var normed = scratch.Take(seqLen, d);
         x.ReadSpan.CopyTo(normed.Span);
         Ops.ZcRmsNorm(normed, w.NormIn.ReadSpan);
@@ -453,7 +453,7 @@ public sealed class Needle2Model
         int repeats = heads / kvHeads;
         int seqLen = x.Length / d;
 
-        long mark = StageProfiler.Mark(Profiler);
+        var mark = StageProfiler.Mark(Profiler);
         // Query, key, value and the output gate all project the same normalised
         // block input; bind it once so the rotation is not redone four times.
         _rotation.Bind(x);

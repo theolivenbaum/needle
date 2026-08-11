@@ -25,7 +25,8 @@ public static class CliEntry
           needle info       --weights <dir|file|.cact> [--config <path>] [--dense]
           needle run        --weights <dir|file|.cact> [--config <path>] --tokens 2,100 [--max-new 32] [--dense]
           needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
-          needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense] [--profile]
+          needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
+                            [--profile] [--profile-alloc]
           needle finetune   --weights <file.cact> --data <file.jsonl> --out <adapter.safetensors>
                             [--epochs 3] [--lr 1e-4] [--rank 16] [--alpha 32] [--max-len 128]
                             [--batch-size 4] [--eval]
@@ -41,7 +42,9 @@ public static class CliEntry
           run         Greedy-decode from raw token IDs with the KV-cached session.
           bench       Time prefill and decode separately, and report weight
                       storage, scratch high-water and bytes allocated per token.
-                      --profile adds a per-stage breakdown of the decode loop.
+                      --profile adds a per-stage breakdown of the decode loop;
+                      --profile-alloc attributes allocation instead, at the cost
+                      of the timings in the same run.
           finetune    LoRA fine-tune on a JSONL dataset. The base stays frozen;
                       only the adapters train, and they merge back at export.
 
@@ -338,7 +341,10 @@ public static class CliEntry
 
         // Stage probes are charged to decode only: prefill and decode have
         // different shapes and averaging them together hides both.
-        var profiler = options.GetFlag("profile") ? new StageProfiler() : null;
+        bool trackAllocations = options.GetFlag("profile-alloc");
+        var profiler = options.GetFlag("profile") || trackAllocations
+            ? new StageProfiler { TrackAllocations = trackAllocations }
+            : null;
         model.Profiler = profiler;
         profiler?.StartWall();
 
@@ -374,6 +380,9 @@ public static class CliEntry
         if (profiler is not null)
         {
             Console.WriteLine();
+            if (trackAllocations)
+                Console.WriteLine("(--profile-alloc reads the allocation counter twice per stage; "
+                                  + "the timings below are inflated by it)");
             Console.WriteLine(profiler.Report(decodeSteps));
         }
         return 0;

@@ -90,7 +90,8 @@ score dropping accordingly.
 needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
 needle run        --weights <dir|file|.cact> --tokens 2,100,200 [--max-new 32]
 needle info       --weights <dir|file|.cact> [--dense]
-needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense] [--profile]
+needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
+                  [--profile] [--profile-alloc]
 needle finetune   --weights <file.cact> --data <file.jsonl> --out <adapter.safetensors>
                   [--epochs 3] [--lr 1e-4] [--rank 16] [--alpha 32] [--max-len 128]
                   [--batch-size 4] [--eval]
@@ -179,33 +180,56 @@ a byte-indexed table and a scalar tail.
 ```sh
 needle bench --weights needle2.cact                    # packed
 needle bench --weights needle2.cact --dense            # expanded to float32
-needle bench --weights needle2.cact --profile          # per-stage breakdown
+needle bench --weights needle2.cact --profile          # per-stage timings
+needle bench --weights needle2.cact --profile-alloc    # per-stage allocation
 ```
 
-|              | packed | float32 |
-|---|---|---|
-| weights      | **13.6 MB** (2.50 bits/parameter) | 173.1 MB |
-| prefill      | **356 tok/s** | 517 tok/s |
-| decode       | **127 tok/s** | 63 tok/s |
-| allocated    | 21 KB/token | 37 KB/token |
+Throughput depends sharply on whether the machine has AVX-512, because that is
+what the codebook permute needs. `needle bench` prints which vector widths the
+run actually got. On a 4-core 2.8 GHz Xeon VM, 128-token prompt, 300 decode
+steps, best of several interleaved runs:
 
-Both produce identical token streams, and the packed path is now the faster one
-as well as the smaller one — twice as fast to decode as float32, because at two
-bits a token's weights are 13.6 MB rather than 173 MB and the decode loop stopped
-being the bottleneck. 13.6 MB of weights plus a 4.7 MB scratch arena and a
+|              | packed, AVX-512 | packed, AVX2 | float32, AVX2 |
+|---|---|---|---|
+| weights      | **13.6 MB** (2.50 bits/parameter) | 13.6 MB | 173.1 MB |
+| prefill      | 356 tok/s | 207 tok/s | 395 tok/s |
+| decode       | **127 tok/s** | 67 tok/s | 54 tok/s |
+| allocated    | 21 KB/token | 21 KB/token | 37 KB/token |
+
+The two columns are the same binary on the same VM before and after it lost
+AVX-512 mid-session, so read them as two machines rather than as one comparison:
+absolute figures move with the host. What holds in both is the ordering — packed
+decodes faster than float32 either way, so the packed path is both the smaller
+and the quicker one, and 13.6 MB of weights plus a 4.7 MB scratch arena and a
 bounded KV cache is what makes the model fit the memory budget it was designed
-for. Measured on a 4-core 2.1 GHz Xeon VM with AVX-512.
+for.
+
+Without AVX-512 the packed kernels fall back to a byte-indexed table for two bits
+and a scalar loop for four, which costs roughly half the decode rate. An AVX2
+path for both is the obvious next step (see [todo.md](todo.md)).
 
 Float32 decode is bound by streaming weights: 173 MB per token at roughly
 10 GB/s. Splitting one output row across the four cores makes it *slower*
 (45 tok/s against 60) — a decode step runs 135 of these matmuls and the dispatch
 costs more than the work — so decode stays serial and only prefill parallelises.
+That is also why packed overtakes it: at two bits a token reads 13.6 MB instead
+of 173 MB, so the bandwidth wall moves out of the way.
 
 Per-token garbage is down from ~295 KB to ~21 KB: layer temporaries come from a
 pooled bump arena that rewinds between layers, the engram sites stream their
 convolution history in a ring buffer instead of recomputing a twelve-token
 window each step, and the logits row and attention plan are reused across steps.
 Decode triggers no collections at all.
+
+`--profile-alloc` says where the remaining 21 KB goes, and it is almost all
+bookkeeping rather than data. About 16 KB is `NdArray` *view* objects: the arena
+pools the float storage but still hands back a 40-byte wrapper per tensor, and a
+layer takes fifteen of them (four attention projections, three lane gates, two
+block norms, and one each for the context, output, MLP, lane read, lane reduce
+and residual). Twenty-seven layers make roughly 400 wrappers a token. The other
+4 KB is two arrays that genuinely are new each step — the embedding row and the
+final hidden state, 2 KB of float32 apiece — plus about 1 KB of engram plumbing
+and the attention plan. Nothing scales with the window or the sequence.
 
 All numbers are measured after a warm-up pass over the real shapes — tiered JIT
 needs it, and timing a cold run measures the interpreter.
@@ -229,7 +253,8 @@ which part of the model is. Per token, packed:
 | everything else | 240 | 3% |
 
 Profiling this way, plus `dotnet-trace` for the function-level view, turned up
-five things worth fixing — decode went from 60 to 133 tok/s packed:
+five things worth fixing. Interleaved against the previous build, packed decode
+went 60 → 133 tok/s with AVX-512 and 49 → 67 tok/s without:
 
 - **The packed inner loops were scalar or narrow.** Two-bit codes were decoded
   through a 4 KB byte→`Vector4` table, one dependent load per four weights; four
@@ -259,7 +284,10 @@ five things worth fixing — decode went from 60 to 133 tok/s packed:
 Measuring took as much care as fixing. Run-to-run spread on a shared VM is
 several percent, enough to swamp a real 5% win, so changes were judged by
 building both versions and interleaving them best-of-N rather than by comparing
-successive runs.
+successive runs. Even that only protects the ratio: partway through this work the
+VM stopped reporting AVX-512, which halved every absolute figure and cut the
+speedup from 2.2× to 1.4× — hence the two columns above, and hence `bench`
+printing the vector widths it actually got.
 
 ## Training
 

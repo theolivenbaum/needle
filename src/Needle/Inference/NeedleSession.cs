@@ -122,7 +122,7 @@ public sealed class NeedleSession
         Length += tokens.Length;
 
         var profiler = _model.Profiler;
-        long mark = StageProfiler.Mark(profiler);
+        var mark = StageProfiler.Mark(profiler);
         var mask = new SequenceMask(Length, Window, _valid, _sink);
         var plan = _plans.Build(mask, start, tokens.Length, Length);
         StageProfiler.Add(profiler, Stage.AttentionPlan, mark);

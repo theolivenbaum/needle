@@ -74,9 +74,19 @@ public sealed class StageProfiler
     private static readonly double TicksToMs = 1000.0 / Stopwatch.Frequency;
 
     private readonly long[] _ticks = new long[AllStages.Length];
+    private readonly long[] _bytes = new long[AllStages.Length];
     private readonly long[] _calls = new long[AllStages.Length];
     private long _wallStart;
     private long _wallTicks;
+
+    /// <summary>
+    /// Also record heap bytes per stage.  Off by default: reading the allocation
+    /// counter is a transition into the runtime, and at two reads per probe over
+    /// five thousand probes a token it costs more than the stages being measured
+    /// — enough to halve the throughput it is supposed to be reporting on.  Turn
+    /// it on to attribute allocation, and read the timings from a separate run.
+    /// </summary>
+    public bool TrackAllocations { get; init; }
 
     /// <summary>Start of the region the stage totals are a breakdown of.</summary>
     public void StartWall() => _wallStart = Stopwatch.GetTimestamp();
@@ -88,30 +98,54 @@ public sealed class StageProfiler
     public void Reset()
     {
         Array.Clear(_ticks);
+        Array.Clear(_bytes);
         Array.Clear(_calls);
         _wallTicks = 0;
     }
 
     /// <summary>
-    /// Read the clock, or return 0 when <paramref name="profiler"/> is null — the
-    /// static form so a call site costs one null check when nothing is attached.
+    /// The clock and allocation counter at the start of a stage.  A struct, so
+    /// taking one does not itself allocate and skew what it is measuring.
     /// </summary>
-    public static long Mark(StageProfiler? profiler) =>
-        profiler is null ? 0L : Stopwatch.GetTimestamp();
+    public readonly record struct Probe(long Ticks, long Bytes);
 
-    /// <summary>Charge the elapsed time since <paramref name="mark"/> to a stage.</summary>
-    public static void Add(StageProfiler? profiler, Stage stage, long mark)
+    /// <summary>
+    /// Read the clock and the allocation counter, or return nothing when
+    /// <paramref name="profiler"/> is null — the static form so a call site costs
+    /// one null check when nothing is attached.
+    /// </summary>
+    public static Probe Mark(StageProfiler? profiler) =>
+        profiler is null
+            ? default
+            : new Probe(Stopwatch.GetTimestamp(),
+                        profiler.TrackAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L);
+
+    /// <summary>
+    /// Charge the time and heap allocated since <paramref name="mark"/> to a
+    /// stage.  Allocation is per-thread, so the figures are the calling thread's:
+    /// exact for a decode step, which is single-threaded, and an undercount for a
+    /// prefill that fans out.
+    /// </summary>
+    public static void Add(StageProfiler? profiler, Stage stage, Probe mark)
     {
         if (profiler is null) return;
-        profiler._ticks[(int)stage] += Stopwatch.GetTimestamp() - mark;
+        profiler._ticks[(int)stage] += Stopwatch.GetTimestamp() - mark.Ticks;
+        if (profiler.TrackAllocations)
+            profiler._bytes[(int)stage] += GC.GetAllocatedBytesForCurrentThread() - mark.Bytes;
         profiler._calls[(int)stage]++;
     }
 
     /// <summary>Milliseconds charged to <paramref name="stage"/>.</summary>
     public double Milliseconds(Stage stage) => _ticks[(int)stage] * TicksToMs;
 
+    /// <summary>Bytes charged to <paramref name="stage"/>.</summary>
+    public long Bytes(Stage stage) => _bytes[(int)stage];
+
     /// <summary>Total milliseconds across every stage.</summary>
     public double TotalMilliseconds => _ticks.Sum() * TicksToMs;
+
+    /// <summary>Total bytes across every stage.</summary>
+    public long TotalBytes => _bytes.Sum();
 
     /// <summary>Milliseconds of wall time in the measured region.</summary>
     public double WallMilliseconds => _wallTicks * TicksToMs;
@@ -126,7 +160,9 @@ public sealed class StageProfiler
         double wall = WallMilliseconds > 0 ? WallMilliseconds : TotalMilliseconds;
         var lines = new List<string>
         {
-            $"{"stage",-16}{"ms",9}{"% wall",9}{"calls",10}" + (tokens > 0 ? $"{"us/token",11}" : ""),
+            $"{"stage",-16}{"ms",9}{"% wall",9}{"calls",10}"
+            + (tokens > 0 ? $"{"us/token",11}" : "")
+            + (tokens > 0 && TrackAllocations ? $"{"B/token",11}" : ""),
         };
 
         foreach (var stage in AllStages.OrderByDescending(s => _ticks[(int)s]))
@@ -134,12 +170,18 @@ public sealed class StageProfiler
             if (_calls[(int)stage] == 0) continue;
             double ms = Milliseconds(stage);
             lines.Add($"{stage,-16}{ms,9:F1}{ms * 100 / wall,8:F1}%{_calls[(int)stage],10}"
-                      + (tokens > 0 ? $"{ms * 1000 / tokens,11:F1}" : ""));
+                      + (tokens > 0 ? $"{ms * 1000 / tokens,11:F1}" : "")
+                      + (tokens > 0 && TrackAllocations
+                          ? $"{_bytes[(int)stage] / (double)tokens,11:F0}"
+                          : ""));
         }
 
         double accounted = TotalMilliseconds;
         lines.Add($"{"(unattributed)",-16}{wall - accounted,9:F1}{(wall - accounted) * 100 / wall,8:F1}%");
-        lines.Add($"{"total",-16}{wall,9:F1}{100.0,8:F1}%");
+        lines.Add($"{"total",-16}{wall,9:F1}{100.0,8:F1}%"
+                  + (tokens > 0 && TrackAllocations
+                      ? $"{"",10}{"",11}{TotalBytes / (double)tokens,11:F0}"
+                      : ""));
         return string.Join(Environment.NewLine, lines);
     }
 }

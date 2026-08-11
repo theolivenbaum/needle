@@ -55,10 +55,20 @@ Inference-side gaps, in rough order of usefulness:
 
 - **The packed kernels need AVX-512 to be fast.** Both the two- and four-bit
   inner loops decode a vector of weights with a lane permute of the codebook,
-  which needs `Avx512F`; without it they fall back to the byte-table and scalar
-  forms, which are roughly a third the speed. An AVX2 path is possible for four
-  bits (`PermuteVar8x32` covers eight of the sixteen entries, so it would take
-  two permutes and a blend) and for two bits (four entries fit one permute).
+  which needs `Avx512F`; without it two bits falls back to a byte-indexed table
+  and four bits to a scalar loop, roughly halving decode. Measured on the same VM
+  before and after it stopped reporting AVX-512: 133 against 67 tok/s. An AVX2
+  path is straightforward for two bits (four codebook entries fit one
+  `PermuteVar8x32`) and takes two permutes and a blend for four bits (eight
+  entries per permute against sixteen needed). Both paths are correct today —
+  parity, `cact-check` and the whole suite pass either way — just slower.
+
+- **Decode allocates ~21 KB a token, nearly all of it `NdArray` wrappers.** The
+  arena pools the float storage, but each `Take` still returns a 40-byte view
+  object, about 400 a token. Making the view a struct would remove most of it;
+  the remaining 4 KB is the embedding row and the final hidden state, which could
+  come from the arena or a session-owned buffer. It causes no collections at
+  present, so this is a tidiness item rather than a throughput one.
 
 - **The grammar only constrains names and argument keys**, not argument *values*.
   Upstream's engine also compiles `Field` constraints — ranges, patterns,
