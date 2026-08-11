@@ -1,4 +1,5 @@
 using System.Numerics.Tensors;
+using Needle.Diagnostics;
 using Needle.Math;
 
 namespace Needle.Model;
@@ -54,6 +55,11 @@ public sealed class Needle2Model
     private readonly ScratchArena _scratch = new();
     private readonly StackStatePool _stacks = new();
 
+    // Packed weights want their input rotated before the dot; the rotation
+    // depends on the activation, not the matrix, so consecutive projections of
+    // one activation share it.  Ignored entirely by float32 weights.
+    private readonly Weights.PreparedActivation _rotation = new();
+
     /// <summary>Geometry of this model.</summary>
     public TransformerConfig Config => _cfg;
 
@@ -65,6 +71,12 @@ public sealed class Needle2Model
 
     /// <summary>Peak scratch demand in floats, for sizing diagnostics.</summary>
     public long ScratchHighWater => _scratch.HighWater;
+
+    /// <summary>
+    /// Attach to break a forward pass down by stage.  Null by default, and every
+    /// probe is a null check when it is.
+    /// </summary>
+    public StageProfiler? Profiler { get; set; }
 
     public Needle2Model(Needle2Weights weights)
     {
@@ -173,7 +185,9 @@ public sealed class Needle2Model
         ITrace? trace = null)
     {
         int seqLen = tokens.Length;
+        long mark = StageProfiler.Mark(Profiler);
         var x0 = Embed(tokens);
+        StageProfiler.Add(Profiler, Stage.Embed, mark);
         trace?.Record("embed", x0);
 
         var stack = _stacks.Rent(_cfg, seqLen);
@@ -191,16 +205,18 @@ public sealed class Needle2Model
             RunLayer(layer, stack, plan, engram, startPosition, caches?[layer], trace, scratch);
             if (cells is not null)
             {
-                var mark = scratch.Mark;
+                var cellMark = scratch.Mark;
                 CopyCell(stack.LaneMean(scratch), cells, layer + 1);
-                scratch.RewindTo(mark);
+                scratch.RewindTo(cellMark);
             }
         }
         scratch.Reset();
 
+        mark = StageProfiler.Mark(Profiler);
         var hidden = new NdArray(seqLen, _cfg.DModel);
         stack.LaneMeanInto(hidden);
         Ops.ZcRmsNorm(hidden, _w.FinalNorm.ReadSpan);
+        StageProfiler.Add(Profiler, Stage.Logits, mark);
         trace?.Record("hidden", hidden);
 
         _stacks.Return(stack);
@@ -230,15 +246,23 @@ public sealed class Needle2Model
         var m = _w.Mhc[layer];
 
         // nx = rms_unit(x.reshape(T, lanes*D)) — the shared read of every lane.
+        long mark = StageProfiler.Mark(Profiler);
         var nx = scratch.Take(seqLen, lanes * d);
         stack.Lanes.ReadSpan.CopyTo(nx.Span);
         Ops.RmsUnit(nx);
+        StageProfiler.Add(Profiler, Stage.LaneRead, mark);
 
         // hpre = sigmoid(a_pre * (nx @ phi_pre) + b_pre + pre_off)
-        var hpre = m.PhiPre.Apply(nx, scratch);
+        mark = StageProfiler.Mark(Profiler);
+        // The pre, post and routing gates are three projections of one 2048-wide
+        // lane vector, and rotating it is far more work than the projections are.
+        _rotation.Bind(nx);
+        var hpre = m.PhiPre.Apply(nx, scratch, _rotation);
         ApplyGate(hpre, m.APre, m.BPre.ReadSpan, m.PreOffset, doubled: false);
+        StageProfiler.Add(Profiler, Stage.LaneGates, mark);
 
         // u = einsum("btn,btnc->btc", hpre, x)
+        mark = StageProfiler.Mark(Profiler);
         var u = scratch.Take(seqLen, d, clear: true);
         for (int t = 0; t < seqLen; t++)
         {
@@ -247,6 +271,7 @@ public sealed class Needle2Model
             for (int n = 0; n < lanes; n++)
                 Ops.AddScaled(dst, stack.Lane(t, n), gates[n]);
         }
+        StageProfiler.Add(Profiler, Stage.LaneReduce, mark);
 
         trace?.Record($"layer{layer:D2}.u", u);
 
@@ -257,9 +282,11 @@ public sealed class Needle2Model
         int site = _cfg.EngramLayers.IndexOf(layer);
         if (site >= 0 && engram is not null)
         {
+            mark = StageProfiler.Mark(Profiler);
             blockInput = scratch.Take(seqLen, d);
             u.ReadSpan.CopyTo(blockInput.Span);
             InjectEngram(blockInput, engram.Keys[site], engram.Values[site], trace, layer, scratch);
+            StageProfiler.Add(Profiler, Stage.Engram, mark);
             trace?.Record($"layer{layer:D2}.bx", blockInput);
         }
 
@@ -269,11 +296,16 @@ public sealed class Needle2Model
         trace?.Record($"layer{layer:D2}.y", y);
 
         // hpost = 2 * sigmoid(a_post * (nx @ phi_post) + b_post + post_off)
-        var hpost = m.PhiPost.Apply(nx, scratch);
+        mark = StageProfiler.Mark(Profiler);
+        var hpost = m.PhiPost.Apply(nx, scratch, _rotation);
         ApplyGate(hpost, m.APost, m.BPost.ReadSpan, m.PostOffset, doubled: true);
 
         // hres = sinkhorn(a_res * (nx @ phi_res) + b_res)
-        var res = m.PhiRes.Apply(nx, scratch);
+        var res = m.PhiRes.Apply(nx, scratch, _rotation);
+        StageProfiler.Add(Profiler, Stage.LaneGates, mark);
+        _rotation.Release();
+
+        mark = StageProfiler.Mark(Profiler);
         var resSpan = res.Span;
         var bRes = m.BRes.ReadSpan;
         for (int t = 0; t < seqLen; t++)
@@ -282,8 +314,11 @@ public sealed class Needle2Model
             for (int i = 0; i < block.Length; i++) block[i] = m.ARes * block[i] + bRes[i];
             Sinkhorn.Normalize(block, lanes);
         }
+        StageProfiler.Add(Profiler, Stage.Sinkhorn, mark);
 
+        mark = StageProfiler.Mark(Profiler);
         stack.Mix(res, hpost, y);
+        StageProfiler.Add(Profiler, Stage.LaneMix, mark);
         trace?.Record($"layer{layer:D2}.x", stack.Lanes);
     }
 
@@ -327,12 +362,17 @@ public sealed class Needle2Model
         int seqLen = x.Length / d;
         scratch ??= _scratch;
 
+        long mark = StageProfiler.Mark(Profiler);
         var normed = scratch.Take(seqLen, d);
         x.ReadSpan.CopyTo(normed.Span);
         Ops.ZcRmsNorm(normed, w.NormIn.ReadSpan);
+        StageProfiler.Add(Profiler, Stage.BlockNorm, mark);
 
         var attn = Attention(normed, w, plan, startPosition, cache, scratch);
+
+        mark = StageProfiler.Mark(Profiler);
         Ops.ZcRmsNorm(attn, w.PostAttnNorm.ReadSpan);
+        StageProfiler.Add(Profiler, Stage.BlockNorm, mark);
         if (layer >= 0) trace?.Record($"layer{layer:D2}.attn", attn);
 
         // h = x + sigmoid(attn_gate) * attn
@@ -341,10 +381,15 @@ public sealed class Needle2Model
         x.ReadSpan.CopyTo(h.Span);
         Ops.AddScaled(h.Span, attn.ReadSpan, gate);
 
+        mark = StageProfiler.Mark(Profiler);
         var mlpIn = scratch.Take(seqLen, d);
         h.ReadSpan.CopyTo(mlpIn.Span);
         Ops.ZcRmsNorm(mlpIn, w.PreHadaNorm.ReadSpan);
+        StageProfiler.Add(Profiler, Stage.BlockNorm, mark);
+
+        mark = StageProfiler.Mark(Profiler);
         var mlp = HadamardMlp(mlpIn, w, seqLen, scratch);
+        StageProfiler.Add(Profiler, Stage.HadamardMlp, mark);
         if (layer >= 0) trace?.Record($"layer{layer:D2}.mlp", mlp);
 
         Ops.Add(h.Span, mlp.ReadSpan);
@@ -408,10 +453,16 @@ public sealed class Needle2Model
         int repeats = heads / kvHeads;
         int seqLen = x.Length / d;
 
-        var q = w.QProj.Apply(x, scratch);
-        var k = w.KProj.Apply(x, scratch);
-        var v = w.VProj.Apply(x, scratch);
+        long mark = StageProfiler.Mark(Profiler);
+        // Query, key, value and the output gate all project the same normalised
+        // block input; bind it once so the rotation is not redone four times.
+        _rotation.Bind(x);
+        var q = w.QProj.Apply(x, scratch, _rotation);
+        var k = w.KProj.Apply(x, scratch, _rotation);
+        var v = w.VProj.Apply(x, scratch, _rotation);
+        StageProfiler.Add(Profiler, Stage.QkvProject, mark);
 
+        mark = StageProfiler.Mark(Profiler);
         NormHeads(q, heads, headDim, w.QNorm.ReadSpan);
         NormHeads(k, kvHeads, headDim, w.KNorm.ReadSpan);
         _rope.ApplyRows(q, heads, startPosition);
@@ -427,6 +478,7 @@ public sealed class Needle2Model
 
         var context = scratch.Take(seqLen, a);
         float scale = 1f / MathF.Sqrt(headDim);
+
         var scoreBuffer = scratch.TakeSpan(System.Math.Max(1, plan.MaxKeys));
 
         for (int t = 0; t < seqLen; t++)
@@ -437,28 +489,29 @@ public sealed class Needle2Model
                 int kvHead = h / repeats;
                 var qHead = q.Row(t).Slice(h * headDim, headDim);
                 var outHead = context.Row(t).Slice(h * headDim, headDim);
-                outHead.Clear();
-                if (allowed.Length == 0) continue;
+                if (allowed.Length == 0) { outHead.Clear(); continue; }
 
                 var scores = scoreBuffer[..allowed.Length];
-                for (int i = 0; i < allowed.Length; i++)
-                {
-                    scores[i] = TensorPrimitives.Dot(
-                        qHead, keys.ReadRow(allowed[i]).Slice(kvHead * headDim, headDim)) * scale;
-                }
+                AttentionKernels.Scores(qHead, keys.ReadSpan, allowed, kvDim, kvHead * headDim, scale, scores);
                 Ops.Softmax(scores);
-
-                for (int i = 0; i < allowed.Length; i++)
-                    Ops.AddScaled(outHead, values.ReadRow(allowed[i]).Slice(kvHead * headDim, headDim), scores[i]);
+                AttentionKernels.Combine(outHead, values.ReadSpan, allowed, kvDim, kvHead * headDim, scores);
             }
         }
 
+        StageProfiler.Add(Profiler, Stage.AttentionCore, mark);
+
         // out *= sigmoid(x @ gate_proj)
-        var gate = w.GateProj.Apply(x, scratch);
+        mark = StageProfiler.Mark(Profiler);
+        var gate = w.GateProj.Apply(x, scratch, _rotation);
         Ops.Sigmoid(gate.Span);
         Ops.Multiply(context.Span, gate.ReadSpan);
+        StageProfiler.Add(Profiler, Stage.QkvProject, mark);
+        _rotation.Release();
 
-        return w.OutProj.Apply(context, scratch);
+        mark = StageProfiler.Mark(Profiler);
+        var projected = w.OutProj.Apply(context, scratch);
+        StageProfiler.Add(Profiler, Stage.OutProject, mark);
+        return projected;
     }
 
     /// <summary>Zero-centred RMSNorm applied independently to each head.</summary>

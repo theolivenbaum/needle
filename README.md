@@ -90,7 +90,7 @@ score dropping accordingly.
 needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
 needle run        --weights <dir|file|.cact> --tokens 2,100,200 [--max-new 32]
 needle info       --weights <dir|file|.cact> [--dense]
-needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
+needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense] [--profile]
 needle finetune   --weights <file.cact> --data <file.jsonl> --out <adapter.safetensors>
                   [--epochs 3] [--lr 1e-4] [--rank 16] [--alpha 32] [--max-len 128]
                   [--batch-size 4] [--eval]
@@ -141,19 +141,19 @@ Everything left is float32 rounding: the reference runs the same arithmetic in a
 different order.
 
 Fixtures are generated rather than committed (the float32 checkpoint alone is
-180 MB). `dotnet test` runs 135 tests; the six that need fixtures skip cleanly
+180 MB). `dotnet test` runs 141 tests; the six that need fixtures skip cleanly
 when they are absent, and pick them up from `fixtures/` or `$NEEDLE_FIXTURES`.
 
 ## Layout
 
 ```
-src/Needle/Math/          NdArray, SIMD GEMM, norms, Walsh-Hadamard, Sinkhorn
+src/Needle/Math/          NdArray, SIMD GEMM, attention kernels, Walsh-Hadamard
 src/Needle/Model/         the model: attention, engram, MHC stack, heads
 src/Needle/Weights/       .cact reader, Cactus-Quant, safetensors, config
 src/Needle/Tokenizer/     SentencePiece BPE from the blob, chat template
 src/Needle/Inference/     KV-cached session, agent API, constrained decoding
 src/Needle/Training/      autodiff tape, tape-based model, LoRA, AdamW, the loop
-src/Needle/Diagnostics/   the parity harnesses
+src/Needle/Diagnostics/   the parity harnesses and the stage profiler
 scripts/parity/           the Python side of those harnesses
 .reference/               upstream, vendored verbatim
 ```
@@ -170,35 +170,96 @@ x · (q @ H) = (x @ H) · q
 ```
 
 Transforming the *activation* once per group replaces transforming every weight
-row, and what is left is a dot product against 2-bit codebook indices — for
-which a 256-entry table maps each byte to the four values it encodes, one vector
-multiply-add per four weights.
+row, and what is left is a dot product against codebook indices. A codebook is
+small enough to live in one vector — four entries at two bits, sixteen at four —
+so a lane permute turns sixteen packed codes into sixteen weights with no memory
+traffic beyond the codes themselves. Without AVX-512 the same loops fall back to
+a byte-indexed table and a scalar tail.
 
 ```sh
-needle bench --weights needle2.cact          # packed
-needle bench --weights needle2.cact --dense  # expanded to float32
+needle bench --weights needle2.cact                    # packed
+needle bench --weights needle2.cact --dense            # expanded to float32
+needle bench --weights needle2.cact --profile          # per-stage breakdown
 ```
 
 |              | packed | float32 |
 |---|---|---|
 | weights      | **13.6 MB** (2.50 bits/parameter) | 173.1 MB |
-| prefill      | 159 tok/s | 302 tok/s |
-| decode       | 53 tok/s  | 48 tok/s  |
-| allocated    | 33 KB/token | 37 KB/token |
+| prefill      | **356 tok/s** | 517 tok/s |
+| decode       | **127 tok/s** | 63 tok/s |
+| allocated    | 21 KB/token | 37 KB/token |
 
-Both produce identical token streams. The footprint is the point: 13.6 MB of
-weights plus a 4.7 MB scratch arena and a bounded KV cache is what makes the
-model fit the memory budget it was designed for. On a 4-core 2.8 GHz Xeon VM the
-speeds are close enough that either is usable; prefill favours float32 because
-dense GEMM vectorises eight lanes wide against the codec's four.
+Both produce identical token streams, and the packed path is now the faster one
+as well as the smaller one — twice as fast to decode as float32, because at two
+bits a token's weights are 13.6 MB rather than 173 MB and the decode loop stopped
+being the bottleneck. 13.6 MB of weights plus a 4.7 MB scratch arena and a
+bounded KV cache is what makes the model fit the memory budget it was designed
+for. Measured on a 4-core 2.1 GHz Xeon VM with AVX-512.
 
-Per-token garbage is down from ~295 KB to ~33 KB: layer temporaries come from a
+Float32 decode is bound by streaming weights: 173 MB per token at roughly
+10 GB/s. Splitting one output row across the four cores makes it *slower*
+(45 tok/s against 60) — a decode step runs 135 of these matmuls and the dispatch
+costs more than the work — so decode stays serial and only prefill parallelises.
+
+Per-token garbage is down from ~295 KB to ~21 KB: layer temporaries come from a
 pooled bump arena that rewinds between layers, the engram sites stream their
 convolution history in a ring buffer instead of recomputing a twelve-token
 window each step, and the logits row and attention plan are reused across steps.
+Decode triggers no collections at all.
 
-Numbers above were measured after a warm-up pass over the real shapes — tiered
-JIT needs it, and timing a cold run measures the interpreter.
+All numbers are measured after a warm-up pass over the real shapes — tiered JIT
+needs it, and timing a cold run measures the interpreter.
+
+## Where the time goes
+
+`needle bench --profile` attaches a stage timer to the decode loop. It answers a
+question a sampling profiler cannot: the same GEMM kernel serves the projections,
+the gates and the output head, so knowing which *function* is hot does not say
+which part of the model is. Per token, packed:
+
+| stage | µs | share |
+|---|---|---|
+| Q/K/V and output-gate projections | 2710 | 34% |
+| attention scores, softmax, weighted sum | 1564 | 20% |
+| tied output projection over the vocabulary | 1215 | 15% |
+| attention output projection | 918 | 12% |
+| hyper-connection gate projections | 854 | 11% |
+| Sinkhorn routing | 179 | 2% |
+| engram | 171 | 2% |
+| everything else | 240 | 3% |
+
+Profiling this way, plus `dotnet-trace` for the function-level view, turned up
+five things worth fixing — decode went from 60 to 133 tok/s packed:
+
+- **The packed inner loops were scalar or narrow.** Two-bit codes were decoded
+  through a 4 KB byte→`Vector4` table, one dependent load per four weights; four
+  bits had no vector path at all. Both are lane permutes: a four-bit codebook has
+  exactly sixteen entries, which is the width of an AVX-512 permute, and sixteen
+  two-bit codes fit one 32-bit word, so a single variable shift spreads them
+  across all sixteen lanes. That is most of the 2.2×.
+- **The activation rotation was repeated.** Packed weights need their input
+  rotated by the codec's Walsh transform, and the rotation depends on the
+  activation, not the matrix — but query, key, value and the output gate all
+  project the same block input, and all three hyper-connection gates project the
+  same lane vector. Now rotated once per group.
+- **The Walsh butterfly called a helper per block.** A 128-wide group runs seven
+  passes, four of which work in strides of 1 to 8 floats — 120 of the 127 block
+  combinations. The call cost far more than the two adds inside it.
+- **Attention made 110,000 library calls per token.** Eight heads against a
+  256-position window, 27 layers over, each a 64-float dot or scaled add: about
+  23 ns a call for 3 ns of arithmetic. `Math/AttentionKernels.cs` fuses the
+  window into one call per head.
+- **A single-token GEMM read its accumulator back once per reduction row.** The
+  four-row blocking that makes prefill fast does nothing when there is one output
+  row; blocking along the reduction axis instead cuts accumulator traffic to a
+  quarter. Both widths are written out explicitly, because on AVX-512 hardware
+  .NET keeps `Vector<T>` at 256 bits while `TensorPrimitives` uses 512 — the
+  portable form would have lost to the library call it replaced.
+
+Measuring took as much care as fixing. Run-to-run spread on a shared VM is
+several percent, enough to swamp a real 5% win, so changes were judged by
+building both versions and interleaving them best-of-N rather than by comparing
+successive runs.
 
 ## Training
 

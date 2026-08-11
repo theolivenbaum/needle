@@ -21,12 +21,12 @@ previous port was rewritten rather than extended: no TorchSharp, no
 | `model/finetune.py` — `render_example`, JSONL contract | `Tokenizer/ChatMarkers.cs` (`ChatTemplate`), `Training/JsonlDataset.cs` | unit tests |
 | `needle/__init__.py` — the `Needle` session API | `Inference/NeedleAgent.cs` | end-to-end calls from `needle2.cact` |
 | `architecture.py` — `kv_budget_window` | `Model/SequenceMask.cs` (`KvBudget`) | unit tests |
-| `model/quantize.py` — inference on packed weights | `Weights/QuantizedMatrix.cs`, `Weights/CactWeights.cs`, `Model/WeightViews.cs` | identical token streams to the float32 path |
+| `model/quantize.py` — inference on packed weights | `Weights/QuantizedMatrix.cs`, `Weights/CactWeights.cs`, `Model/WeightViews.cs` | identical token streams to the float32 path, plus a direct test of the packed matmul against the dense reconstruction |
 | n/a — safetensors interchange | `Weights/Safetensors.cs` | round-trips the reference dumps |
 | grammar-constrained decoding (upstream moved this into its compiled engine) | `Inference/ConstrainedDecoding.cs`, wired into `NeedleAgent` | unit tests; observed to correct an out-of-schema argument on a real call |
 | `model/finetune.py` — `init_lora`, `LORA_TARGETS`, the AdamW + warmup-cosine loop | `Training/Autodiff/`, `Training/TrainableModel.cs`, `Training/LoraAdapter.cs`, `Training/AdamW.cs`, `Training/Finetuner.cs` | forward parity against the inference model, finite-difference gradient checks, a fine-tune on the released weights |
 
-`dotnet test` → 135 tests. Six need the reference fixtures and skip cleanly when
+`dotnet test` → 141 tests. Six need the reference fixtures and skip cleanly when
 they are absent.
 
 ## Parity results
@@ -53,11 +53,12 @@ it — end-to-end argmax still mostly agreed.
 
 Inference-side gaps, in rough order of usefulness:
 
-- **The packed path is not faster, only smaller.** 13.6 MB against 173 MB, at
-  roughly the same decode rate and about half the prefill rate. The 2-bit inner
-  loop moves four weights per vector operation where dense float32 moves eight or
-  sixteen; closing that needs real intrinsics (masked accumulation per codebook
-  entry, or a wider byte table) rather than portable `Vector4`.
+- **The packed kernels need AVX-512 to be fast.** Both the two- and four-bit
+  inner loops decode a vector of weights with a lane permute of the codebook,
+  which needs `Avx512F`; without it they fall back to the byte-table and scalar
+  forms, which are roughly a third the speed. An AVX2 path is possible for four
+  bits (`PermuteVar8x32` covers eight of the sixteen entries, so it would take
+  two permutes and a blend) and for two bits (four entries fit one permute).
 
 - **The grammar only constrains names and argument keys**, not argument *values*.
   Upstream's engine also compiles `Field` constraints — ranges, patterns,

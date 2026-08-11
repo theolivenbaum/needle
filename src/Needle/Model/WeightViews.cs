@@ -24,7 +24,13 @@ public abstract class LinearWeight
     public abstract long ByteSize { get; }
 
     /// <summary>Multiply <c>[tokens, InputWidth]</c> into <c>[tokens, OutputWidth]</c>.</summary>
-    public abstract void Apply(NdArray x, NdArray destination);
+    /// <param name="x">Activations.</param>
+    /// <param name="destination">Result.</param>
+    /// <param name="shared">
+    /// Rotation shared with the other projections reading the same activation.
+    /// Packed weights need one; float32 weights ignore it.
+    /// </param>
+    public abstract void Apply(NdArray x, NdArray destination, PreparedActivation? shared = null);
 
     /// <summary>Multiply, allocating the result.</summary>
     public NdArray Apply(NdArray x)
@@ -36,11 +42,11 @@ public abstract class LinearWeight
     }
 
     /// <summary>Multiply into a tensor taken from <paramref name="scratch"/>.</summary>
-    public NdArray Apply(NdArray x, ScratchArena scratch)
+    public NdArray Apply(NdArray x, ScratchArena scratch, PreparedActivation? shared = null)
     {
         int tokens = x.Length / InputWidth;
         var destination = scratch.Take(tokens, OutputWidth, clear: false);
-        Apply(x, destination);
+        Apply(x, destination, shared);
         return destination;
     }
 
@@ -68,7 +74,7 @@ public sealed class DenseLinear(NdArray kernel) : LinearWeight
 
     public override long ByteSize => (long)Kernel.Length * sizeof(float);
 
-    public override void Apply(NdArray x, NdArray destination) =>
+    public override void Apply(NdArray x, NdArray destination, PreparedActivation? shared = null) =>
         Ops.MatMulParallel(x, Kernel, destination, x.Length / InputWidth, InputWidth, OutputWidth);
 
     public override NdArray ToDenseKernel() => Kernel;
@@ -88,7 +94,8 @@ public sealed class QuantizedLinear(QuantizedMatrix matrix) : LinearWeight
 
     public override long ByteSize => Matrix.ByteSize;
 
-    public override void Apply(NdArray x, NdArray destination) => Matrix.Apply(x, destination);
+    public override void Apply(NdArray x, NdArray destination, PreparedActivation? shared = null) =>
+        Matrix.Apply(x, destination, shared);
 
     public override NdArray ToDenseKernel()
     {

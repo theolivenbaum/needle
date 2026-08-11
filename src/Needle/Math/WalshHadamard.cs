@@ -1,5 +1,7 @@
 using System.Numerics;
 using System.Numerics.Tensors;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Needle.Math;
 
@@ -63,41 +65,53 @@ public static class WalshHadamard
     /// <summary>
     /// The unnormalised ±1 butterfly.  Blocks of <c>2*half</c> are combined as
     /// <c>(a + b, a - b)</c>, doubling <c>half</c> each pass.
+    ///
+    /// The early passes are the whole cost.  A 128-wide group runs seven passes,
+    /// and the first four of them work in strides of 1, 2, 4 and 8 floats — 120 of
+    /// the 127 block combinations in the transform.  Calling a vectorised helper
+    /// per block spends far more on the call than on the two adds inside it, so
+    /// the loop is written out here: narrow strides go scalar, and only once a
+    /// stride reaches a whole vector does the wide path take over.
+    ///
+    /// A packed decode step runs about 1800 of these, one per quantisation group
+    /// per projection, so this is a hot loop in its own right.
     /// </summary>
     private static void Butterfly(Span<float> x)
     {
         int n = x.Length;
-        for (int half = 1; half < n; half <<= 1)
+        int width = Vector<float>.Count;
+        ref float head = ref MemoryMarshal.GetReference(x);
+
+        int half = 1;
+        for (; half < width && half < n; half <<= 1)
         {
             for (int start = 0; start < n; start += half << 1)
             {
-                var lo = x.Slice(start, half);
-                var hi = x.Slice(start + half, half);
-                CombinePair(lo, hi);
+                for (int i = 0; i < half; i++)
+                {
+                    ref float lo = ref Unsafe.Add(ref head, start + i);
+                    ref float hi = ref Unsafe.Add(ref head, start + half + i);
+                    float a = lo, b = hi;
+                    lo = a + b;
+                    hi = a - b;
+                }
             }
         }
-    }
 
-    /// <summary><c>(lo, hi) = (lo + hi, lo - hi)</c>, vectorised.</summary>
-    private static void CombinePair(Span<float> lo, Span<float> hi)
-    {
-        int i = 0, n = lo.Length;
-        if (Vector.IsHardwareAccelerated && n >= Vector<float>.Count)
+        for (; half < n; half <<= 1)
         {
-            int bound = n - n % Vector<float>.Count;
-            for (; i < bound; i += Vector<float>.Count)
+            for (int start = 0; start < n; start += half << 1)
             {
-                var a = new Vector<float>(lo[i..]);
-                var b = new Vector<float>(hi[i..]);
-                (a + b).CopyTo(lo[i..]);
-                (a - b).CopyTo(hi[i..]);
+                for (int i = 0; i < half; i += width)
+                {
+                    ref float lo = ref Unsafe.Add(ref head, start + i);
+                    ref float hi = ref Unsafe.Add(ref head, start + half + i);
+                    var a = Vector.LoadUnsafe(ref lo);
+                    var b = Vector.LoadUnsafe(ref hi);
+                    Vector.StoreUnsafe(a + b, ref lo);
+                    Vector.StoreUnsafe(a - b, ref hi);
+                }
             }
-        }
-        for (; i < n; i++)
-        {
-            float a = lo[i], b = hi[i];
-            lo[i] = a + b;
-            hi[i] = a - b;
         }
     }
 

@@ -1,3 +1,4 @@
+using Needle.Diagnostics;
 using Needle.Math;
 using Needle.Model;
 
@@ -120,12 +121,21 @@ public sealed class NeedleSession
         for (int i = 0; i < tokens.Length; i++) _valid[start + i] = true;
         Length += tokens.Length;
 
+        var profiler = _model.Profiler;
+        long mark = StageProfiler.Mark(profiler);
         var mask = new SequenceMask(Length, Window, _valid, _sink);
         var plan = _plans.Build(mask, start, tokens.Length, Length);
+        StageProfiler.Add(profiler, Stage.AttentionPlan, mark);
+
+        mark = StageProfiler.Mark(profiler);
         var engram = BuildEngram(start, tokens.Length);
+        StageProfiler.Add(profiler, Stage.Engram, mark);
 
         var result = _model.RunStack(tokens, plan, engram, start, _caches);
+
+        mark = StageProfiler.Mark(profiler);
         _model.LastLogitsInto(result.Hidden, _logits);
+        StageProfiler.Add(profiler, Stage.Logits, mark);
         return _logits.Reshape(_cfg.VocabSize);
     }
 

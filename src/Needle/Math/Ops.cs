@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace Needle.Math;
 
@@ -63,9 +65,11 @@ public static class Ops
         int aOffset = a.Offset, bOffset = b.Offset, cOffset = c.Offset;
 
         // Only the prefill has enough output rows to be worth splitting.  A
-        // single-token decode step is bound by streaming the weights, not by
-        // arithmetic, so spreading one output row over several cores only adds
-        // contention — measured slower on a 4-core box than staying serial.
+        // single-token decode step runs 135 of these, each a few tens of
+        // microseconds, and the dispatch costs more than the work: splitting one
+        // output row across four cores by columns measured 45 tok/s against 60
+        // serial.  What is left is streaming the weights, which one core already
+        // does at about 10 GB/s here.
         if (m < 8)
         {
             MatMulRows(a.ReadSpan, b.ReadSpan, c.Span, 0, m, k, n);
@@ -105,6 +109,17 @@ public static class Ops
             return;
         }
 
+        // Decode projects one token at a time, and one output row cannot reuse a
+        // row of `b` the way the four-row block below does.  Blocking along the
+        // reduction axis instead is what makes it fast: the accumulator stays in
+        // registers across four rows of `b` rather than being read back and
+        // written out once per row.
+        if (rows == 1)
+        {
+            MatMulSingleRow(a[(first * k)..], b, c[(first * n)..], k, n);
+            return;
+        }
+
         int i = first;
         for (; i + 4 <= first + rows; i += 4)
         {
@@ -141,12 +156,168 @@ public static class Ops
     }
 
     /// <summary>
+    /// Accumulate a single output row: <c>c += sum_p a[p] * b[p, :]</c>, with
+    /// <c>c</c> already holding whatever it should be added to.
+    ///
+    /// Written as four rows of <c>b</c> at a time.  The obvious form — one
+    /// <c>MultiplyAdd</c> call per row — reads and writes the whole of <c>c</c>
+    /// once per row of the reduction, so a 512×512 projection moves two megabytes
+    /// through the accumulator to do a quarter of a million multiply-adds.
+    /// Four-way blocking cuts that traffic to a quarter and fuses four library
+    /// calls into one loop body.
+    ///
+    /// The two widths are spelled out rather than written once over
+    /// <c>Vector&lt;float&gt;</c>, because on AVX-512 hardware .NET keeps
+    /// <c>Vector&lt;T&gt;</c> at 256 bits while <c>TensorPrimitives</c> uses 512 —
+    /// so the portable form would hand back half the width the library call it
+    /// replaces was already getting, and lose.
+    /// </summary>
+    private static void MatMulSingleRow(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+                                        int k, int n)
+    {
+        int p = 0;
+        if (Vector512.IsHardwareAccelerated && n >= Vector512<float>.Count) p = Blocked512(a, b, c, k, n);
+        else if (Vector256.IsHardwareAccelerated && n >= Vector256<float>.Count) p = Blocked256(a, b, c, k, n);
+
+        for (; p < k; p++)
+        {
+            float scale = a[p];
+            if (scale != 0f) TensorPrimitives.MultiplyAdd(b.Slice(p * n, n), scale, c[..n], c[..n]);
+        }
+    }
+
+    /// <summary>Four reduction rows at a time, 512 bits wide.  Returns rows consumed.</summary>
+    private static int Blocked512(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int k, int n)
+    {
+        const int width = 16;
+        int bound = n - n % width;
+        ref float cHead = ref MemoryMarshal.GetReference(c);
+        ref float bHead = ref Unsafe.AsRef(in MemoryMarshal.GetReference(b));
+
+        int p = 0;
+        for (; p + 4 <= k; p += 4)
+        {
+            var s0 = Vector512.Create(a[p]);
+            var s1 = Vector512.Create(a[p + 1]);
+            var s2 = Vector512.Create(a[p + 2]);
+            var s3 = Vector512.Create(a[p + 3]);
+            ref float row = ref Unsafe.Add(ref bHead, p * n);
+
+            for (int j = 0; j < bound; j += width)
+            {
+                var acc = Vector512.LoadUnsafe(ref cHead, (nuint)j)
+                          + s0 * Vector512.LoadUnsafe(ref row, (nuint)j)
+                          + s1 * Vector512.LoadUnsafe(ref row, (nuint)(n + j))
+                          + s2 * Vector512.LoadUnsafe(ref row, (nuint)(2 * n + j))
+                          + s3 * Vector512.LoadUnsafe(ref row, (nuint)(3 * n + j));
+                Vector512.StoreUnsafe(acc, ref cHead, (nuint)j);
+            }
+            TailRows(a, b, c, p, n, bound);
+        }
+        return p;
+    }
+
+    /// <summary>Four reduction rows at a time, 256 bits wide.  Returns rows consumed.</summary>
+    private static int Blocked256(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int k, int n)
+    {
+        const int width = 8;
+        int bound = n - n % width;
+        ref float cHead = ref MemoryMarshal.GetReference(c);
+        ref float bHead = ref Unsafe.AsRef(in MemoryMarshal.GetReference(b));
+
+        int p = 0;
+        for (; p + 4 <= k; p += 4)
+        {
+            var s0 = Vector256.Create(a[p]);
+            var s1 = Vector256.Create(a[p + 1]);
+            var s2 = Vector256.Create(a[p + 2]);
+            var s3 = Vector256.Create(a[p + 3]);
+            ref float row = ref Unsafe.Add(ref bHead, p * n);
+
+            for (int j = 0; j < bound; j += width)
+            {
+                var acc = Vector256.LoadUnsafe(ref cHead, (nuint)j)
+                          + s0 * Vector256.LoadUnsafe(ref row, (nuint)j)
+                          + s1 * Vector256.LoadUnsafe(ref row, (nuint)(n + j))
+                          + s2 * Vector256.LoadUnsafe(ref row, (nuint)(2 * n + j))
+                          + s3 * Vector256.LoadUnsafe(ref row, (nuint)(3 * n + j));
+                Vector256.StoreUnsafe(acc, ref cHead, (nuint)j);
+            }
+            TailRows(a, b, c, p, n, bound);
+        }
+        return p;
+    }
+
+    /// <summary>The columns past the last whole vector, for one four-row block.</summary>
+    private static void TailRows(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+                                 int p, int n, int from)
+    {
+        for (int j = from; j < n; j++)
+        {
+            c[j] += a[p] * b[p * n + j] + a[p + 1] * b[(p + 1) * n + j]
+                    + a[p + 2] * b[(p + 2) * n + j] + a[p + 3] * b[(p + 3) * n + j];
+        }
+    }
+
+    /// <summary>
     /// GEMM for a narrow output: accumulates <paramref name="n"/> ≤ 16 columns in
     /// registers while streaming the reduction axis, so the whole product is one
     /// pass with no per-row call overhead.
+    ///
+    /// The hyper-connection gates land here — 2048 inputs onto 4 or 16 outputs,
+    /// three times a layer.  That is a trivial number of multiply-adds, so what
+    /// decides the cost is the per-element overhead around them: a scalar inner
+    /// loop over four columns spends more time on bounds checks and loop control
+    /// than on arithmetic.  Accumulating in <see cref="Vector4"/> registers and
+    /// walking the operands by reference removes both.
     /// </summary>
     private static void MatMulNarrow(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
                                      int first, int rows, int k, int n)
+    {
+        // Four Vector4 lanes cover every width the model uses (4 and 16); a width
+        // that is not a multiple of four falls back to the scalar form.
+        if (n % 4 != 0 || n > 16)
+        {
+            MatMulNarrowScalar(a, b, c, first, rows, k, n);
+            return;
+        }
+
+        int quads = n / 4;
+        ref readonly float bHead = ref MemoryMarshal.GetReference(b);
+
+        for (int i = first; i < first + rows; i++)
+        {
+            Vector4 v0 = Vector4.Zero, v1 = Vector4.Zero, v2 = Vector4.Zero, v3 = Vector4.Zero;
+            ref readonly float aRow = ref Unsafe.Add(ref MemoryMarshal.GetReference(a), i * k);
+
+            for (int p = 0; p < k; p++)
+            {
+                var scale = new Vector4(Unsafe.Add(ref Unsafe.AsRef(in aRow), p));
+                ref readonly float bRow = ref Unsafe.Add(ref Unsafe.AsRef(in bHead), p * n);
+
+                v0 += scale * Load(in bRow, 0);
+                if (quads > 1) v1 += scale * Load(in bRow, 4);
+                if (quads > 2) v2 += scale * Load(in bRow, 8);
+                if (quads > 3) v3 += scale * Load(in bRow, 12);
+            }
+
+            var row = c.Slice(i * n, n);
+            v0.CopyTo(row);
+            if (quads > 1) v1.CopyTo(row[4..]);
+            if (quads > 2) v2.CopyTo(row[8..]);
+            if (quads > 3) v3.CopyTo(row[12..]);
+        }
+    }
+
+    /// <summary>Read four consecutive floats starting <paramref name="at"/> past a reference.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector4 Load(ref readonly float head, int at) =>
+        Unsafe.ReadUnaligned<Vector4>(
+            ref Unsafe.As<float, byte>(ref Unsafe.Add(ref Unsafe.AsRef(in head), at)));
+
+    /// <summary>Narrow GEMM for widths the vector form does not cover.</summary>
+    private static void MatMulNarrowScalar(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+                                           int first, int rows, int k, int n)
     {
         Span<float> accumulator = stackalloc float[16];
 

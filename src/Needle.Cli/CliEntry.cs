@@ -25,7 +25,7 @@ public static class CliEntry
           needle info       --weights <dir|file|.cact> [--config <path>] [--dense]
           needle run        --weights <dir|file|.cact> [--config <path>] --tokens 2,100 [--max-new 32] [--dense]
           needle call       --weights <file.cact> --query <text> [--tools <json|@file>] [--system <text>]
-          needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense]
+          needle bench      --weights <dir|file|.cact> [--prompt 128] [--decode 64] [--dense] [--profile]
           needle finetune   --weights <file.cact> --data <file.jsonl> --out <adapter.safetensors>
                             [--epochs 3] [--lr 1e-4] [--rank 16] [--alpha 32] [--max-len 128]
                             [--batch-size 4] [--eval]
@@ -41,6 +41,7 @@ public static class CliEntry
           run         Greedy-decode from raw token IDs with the KV-cached session.
           bench       Time prefill and decode separately, and report weight
                       storage, scratch high-water and bytes allocated per token.
+                      --profile adds a per-stage breakdown of the decode loop.
           finetune    LoRA fine-tune on a JSONL dataset. The base stays frozen;
                       only the adapters train, and they merge back at export.
 
@@ -335,13 +336,30 @@ public static class CliEntry
         prefill.Stop();
         long prefillBytes = GC.GetAllocatedBytesForCurrentThread() - before;
 
+        // Stage probes are charged to decode only: prefill and decode have
+        // different shapes and averaging them together hides both.
+        var profiler = options.GetFlag("profile") ? new StageProfiler() : null;
+        model.Profiler = profiler;
+        profiler?.StartWall();
+
         before = GC.GetAllocatedBytesForCurrentThread();
+        int gcBefore = GC.CollectionCount(0) + GC.CollectionCount(1) + GC.CollectionCount(2);
         var decode = Stopwatch.StartNew();
         for (int i = 0; i < decodeSteps; i++)
             logits = session.Advance(Ops.ArgMax(logits.ReadSpan));
         decode.Stop();
+        int collections = GC.CollectionCount(0) + GC.CollectionCount(1) + GC.CollectionCount(2) - gcBefore;
         long decodeBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+        profiler?.StopWall();
+        model.Profiler = null;
 
+        // Which vector width the kernels actually got decides how these numbers
+        // read, and it is not simply "whatever the CPU supports": .NET keeps
+        // Vector<T> at 256 bits on AVX-512 hardware unless asked otherwise.
+        Console.WriteLine($"simd             Vector<float> {System.Numerics.Vector<float>.Count} wide, "
+                          + $"Vector256 {(System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated ? "yes" : "no")}, "
+                          + $"Vector512 {(System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated ? "yes" : "no")}, "
+                          + $"{Environment.ProcessorCount} cores");
         Console.WriteLine($"weights          {model.Weights.ByteSize / 1e6:F1} MB "
                           + $"({(model.Weights.IsQuantized ? "packed Cactus-Quant" : "float32")})");
         Console.WriteLine($"scratch arena    {model.ScratchHighWater * 4 / 1e6:F2} MB high water");
@@ -351,6 +369,13 @@ public static class CliEntry
         Console.WriteLine($"decode           {decodeSteps} tokens in {decode.Elapsed.TotalMilliseconds:F0} ms "
                           + $"({decodeSteps * 1000.0 / decode.Elapsed.TotalMilliseconds:F1} tok/s), "
                           + $"{decodeBytes / (double)decodeSteps / 1024.0:F1} KB allocated per token");
+        Console.WriteLine($"collections      {collections} across all generations during decode");
+
+        if (profiler is not null)
+        {
+            Console.WriteLine();
+            Console.WriteLine(profiler.Report(decodeSteps));
+        }
         return 0;
     }
 
